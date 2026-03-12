@@ -1,7 +1,7 @@
 # 📊 NexusData
 
 > **⚠️ 현재 Demo 버전입니다.**  
-> EL_Sensor, EL_Vibration 샘플 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
+> Dataiku 내 EL_Sensor, EL_Vibration 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
 
 Dataiku DSS 웹앱(Streamlit) 기반의 대화형 데이터 분석 도구.  
 사용자의 자연어 질의를 LLM이 해석하여 Python 분석 코드를 자동 생성·실행하고, Plotly 인터랙티브 차트와 통계 인사이트를 제공합니다.
@@ -17,6 +17,11 @@ Dataiku DSS 웹앱(Streamlit) 기반의 대화형 데이터 분석 도구.
 ![분석화면](image/분석화면.png)
 
 ![분석화면2](image/2_분석화면.png)
+
+![분석화면3](image/분석화면3.png)
+
+![분석화면4](image/분석화면4.png)
+
 
 ### 코드 보기 + 추천 질문
 ![코드,추천질문](image/코드,추천질문.png)
