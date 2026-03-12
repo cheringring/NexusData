@@ -359,10 +359,12 @@ STRICT RULES:
    - plotly (DEFAULT): fig = px.scatter(...) or fig = go.Figure(...)
    - matplotlib (only if user explicitly requests): fig, ax = plt.subplots(...)
 8. NEVER use: os, sys, subprocess, open(), eval(), exec(), __import__, requests, urllib
-9. Handle NaN/missing values with dropna() or fillna() before plotting.
-10. Add meaningful titles, axis labels, and legends in Korean.
-11. Return ONLY the Python code block — no explanation, no markdown text outside the code block.
-12. Wrap your code inside ```python ... ``` tags.
+9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
+9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
+10. Handle NaN/missing values with dropna() or fillna() before plotting.
+11. Add meaningful titles, axis labels, and legends in Korean.
+12. Return ONLY the Python code block — no explanation, no markdown text outside the code block.
+13. Wrap your code inside ```python ... ``` tags.
 
 **DEFAULT LIBRARY: Plotly** — ALL charts must use Plotly (px or go) by default.
 This ensures every chart supports hover, zoom, and pan interactions.
@@ -375,6 +377,14 @@ Use matplotlib ONLY if the user explicitly says "정적", "static", or "matplotl
 - For multi-chart requests: use make_subplots to combine into ONE figure (여러 fig 생성 금지)
 - NEVER create multiple separate figures — always ONE fig with subplots
 - Keep trace count under 10 per figure to avoid rendering lag
+- **COMPLEX MULTI-CHART REQUESTS** (히트맵+히스토그램, 상관관계+분포 등):
+  - Do NOT combine imshow (heatmap) with histograms in make_subplots — Plotly does not support mixed subplot types well
+  - Instead: pick the MOST informative single chart type, or use tabs/annotations
+  - For "히트맵 + 히스토그램": just create the heatmap with text_auto=True (it already shows values)
+  - For "전체 변수 분석": use correlation heatmap only — it covers relationships comprehensively
+  - ❌ FORBIDDEN: make_subplots with specs=[[{"type": "heatmap"}], [{"type": "xy"}]] — this WILL crash
+  - ❌ FORBIDDEN: mixing px.imshow() result with make_subplots — incompatible
+  - ✅ CORRECT: use ONLY px.imshow(corr_matrix, text_auto=True) for correlation + values in one chart
 - **CRITICAL: NEVER use add_vrect/add_vline/add_shape inside a loop** — browser will freeze!
   - ❌ FORBIDDEN: `for id in outlier_ids: fig.add_vrect(...)` — this creates 1000+ shapes
   - ❌ FORBIDDEN: `for start, end in ranges[:30]: fig.add_vrect(...)` — data loss (누락)
@@ -385,6 +395,9 @@ Use matplotlib ONLY if the user explicitly says "정적", "static", or "matplotl
 PLOTLY DEFAULT SETTINGS (apply to ALL charts):
 - Always add: fig.update_layout(dragmode='zoom') — enables drag-to-zoom for detailed inspection
 - Always add: fig.update_layout(hovermode='x unified') for line charts, 'closest' for scatter/box
+- NEVER use deprecated properties: titlefont, tickfont as direct dict. Use title_font, tickfont via update_yaxes/update_xaxes instead.
+  - ❌ WRONG: yaxis2=dict(titlefont=dict(color='red'))
+  - ✅ CORRECT: fig.update_yaxes(title_font=dict(color='red'), row=1, col=1) or yaxis2=dict(title=dict(font=dict(color='red')))
 
 CHART SELECTION GUIDE:
 - Trend / time-series / sequential → px.line() with hover
@@ -396,6 +409,13 @@ CHART SELECTION GUIDE:
 - Correlation heatmap → px.imshow() with text_auto=True
 - Category comparison → px.bar() (horizontal preferred)
 - Do NOT always default to bar charts. Pick the most informative chart type.
+- **Statistical report / metric requests** (상관계수, 변화율, 통계 검정 등):
+  NEVER use only print(). You MUST create a Plotly figure that visualizes the result.
+  - Correlation / change rate → scatter plot with trendline + annotate r value
+  - Detection / threshold → line chart highlighting detected regions
+  - Comparison of groups → box/violin plot or grouped bar chart
+  - Summary metrics → go.Table() or go.Indicator() inside a fig
+  - Always combine the statistical calculation WITH a visualization in one fig.
 
 TIME-SERIES / LINE CHART RULES:
 - Always add a rolling mean (이동평균) trace using go.Scattergl for trend visibility (WebGL 가속)
@@ -697,6 +717,50 @@ fig.update_layout(title=f'x1과 x2 변화 + x4 이상치 구간 ({outlier_count}
                   hovermode='x unified', dragmode='zoom')
 ```
 
+Example 11 — Statistical report with visualization (변화율/상관계수 등 통계 리포트):
+User: "humidity 급변 구간에서 vibration 변화율 상관계수를 계산해줘"
+Dataset columns: ID (int64), humidity (float64), vibration (float64)
+
+```python
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+from scipy.stats import pearsonr
+
+plot_df = df[['ID', 'humidity', 'vibration']].dropna().sort_values('ID')
+plot_df['humidity_change'] = plot_df['humidity'].pct_change().fillna(0)
+plot_df['vibration_change'] = plot_df['vibration'].pct_change().fillna(0)
+
+threshold = 0.20
+rapid_mask = plot_df['humidity_change'].abs() > threshold
+rapid_df = plot_df[rapid_mask]
+
+fig = make_subplots(rows=2, cols=1, subplot_titles=['습도/진동 추이 (급변 구간 강조)', '급변 구간 변화율 산점도'],
+                    vertical_spacing=0.15)
+
+# 상단: 추이 + 급변 구간 강조
+fig.add_trace(go.Scattergl(x=plot_df['ID'], y=plot_df['humidity'], mode='lines',
+    name='humidity', line=dict(width=1, color='steelblue')), row=1, col=1)
+fig.add_trace(go.Scattergl(x=rapid_df['ID'], y=rapid_df['humidity'], mode='markers',
+    name='급변 구간', marker=dict(color='red', size=5)), row=1, col=1)
+
+# 하단: 변화율 산점도 + 상관계수 표시
+if len(rapid_df) >= 2:
+    r, p = pearsonr(rapid_df['humidity_change'], rapid_df['vibration_change'])
+    fig.add_trace(go.Scattergl(x=rapid_df['humidity_change'], y=rapid_df['vibration_change'],
+        mode='markers', name=f'r={r:.3f}, p={p:.4f}',
+        marker=dict(color='orange', size=5, opacity=0.6)), row=2, col=1)
+    fig.add_annotation(text=f'변화율 상관계수 r={r:.3f} (p={p:.4f})', xref='paper', yref='paper',
+        x=0.5, y=-0.05, showarrow=False, font=dict(size=14))
+
+fig.update_layout(title=f'습도 급변 구간 분석 (급변 {len(rapid_df)}건 / 전체 {len(plot_df):,}건)',
+                  hovermode='closest', dragmode='zoom', height=700)
+fig.update_xaxes(title_text='ID', row=1, col=1)
+fig.update_xaxes(title_text='humidity 변화율', row=2, col=1)
+fig.update_yaxes(title_text='vibration 변화율', row=2, col=1)
+```
+
 ### END OF EXAMPLES ###
 """
 
@@ -830,55 +894,137 @@ Generate the CORRECTED Python code:
     }
     
     @staticmethod
-    def build_insight_prompt(user_request: str, dataset_info: Dict) -> str:
-        # 품질 알림 메시지 동적 생성
-        quality_alerts = []
-        missing_detail = dataset_info.get('missing_detail', {})
-        for col, v in missing_detail.items():
-            if v['pct'] >= PromptEngine.QUALITY_THRESHOLDS['missing_pct']:
-                quality_alerts.append(f"⚠️ {col} 컬럼 결측치 {v['pct']}% — 분석 신뢰도에 영향 가능")
-        outlier_detail = dataset_info.get('outlier_detail', {})
-        total_rows = dataset_info['shape'][0]
-        for col, cnt in outlier_detail.items():
-            pct = round(cnt / total_rows * 100, 1) if total_rows > 0 else 0
-            if pct >= PromptEngine.QUALITY_THRESHOLDS['outlier_pct']:
-                quality_alerts.append(f"⚠️ {col} 컬럼 이상치 {cnt}건 ({pct}%) — 분포 왜곡 가능")
-        dup_pct = dataset_info.get('dup_pct', 0)
-        if dup_pct >= PromptEngine.QUALITY_THRESHOLDS['duplicate_pct']:
-            quality_alerts.append(f"⚠️ 중복 행 {dataset_info.get('dup_count', 0)}건 ({dup_pct}%) — 밀도/빈도 왜곡 가능")
-        quality_str = "\n".join(quality_alerts) if quality_alerts else "데이터 품질 양호"
+    def build_insight_prompt(user_request: str, dataset_info: Dict, datasets_info: Optional[Dict] = None) -> str:
+        # 멀티 데이터셋일 때: 사용자 요청에 언급된 변수가 속한 데이터셋을 찾아 해당 통계 사용
+        matched_datasets = {}  # {ds_name: (ds_info, match_count)}
 
-        stat_tests_str = dataset_info.get('stat_tests_str', '통계 검정 없음')
-        return f"""You are a sensor data analyst. Provide a concise 2-3 sentence insight.
-Focus on: trends, anomalies, correlations, missing data patterns, and outliers.
+        if datasets_info and len(datasets_info) > 1:
+            request_lower = user_request.lower()
+            for ds_name, ds_info in datasets_info.items():
+                cols = ds_info.get('columns', [])
+                match_count = sum(1 for col in cols if col.lower() in request_lower)
+                # 데이터셋 이름 자체가 언급된 경우도 매칭
+                if ds_name.lower() in request_lower:
+                    match_count += 1
+                if match_count > 0:
+                    matched_datasets[ds_name] = (ds_info, match_count)
+
+        # 매칭된 데이터셋이 여러 개면 모두 포함, 없으면 primary 사용
+        if len(matched_datasets) >= 2:
+            # 멀티 데이터셋 비교 요청
+            all_stats_sections = []
+            all_quality_alerts = []
+            for ds_name, (ds_info, _) in matched_datasets.items():
+                section = f"\n[{ds_name}]\nShape: {ds_info['shape']}\nColumns: {ds_info['columns']}\n"
+                section += f"Statistical Summary:\n{ds_info['describe_str']}\n"
+                section += f"Missing Values: {ds_info.get('missing_str', '결측치 없음')}\n"
+                section += f"Correlation: {ds_info.get('corr_str', '상관계수 정보 없음')}\n"
+                section += f"Outliers (IQR): {ds_info.get('outlier_str', '이상치 없음')}\n"
+                all_stats_sections.append(section)
+                # 품질 알림
+                for col, v in ds_info.get('missing_detail', {}).items():
+                    if v['pct'] >= PromptEngine.QUALITY_THRESHOLDS['missing_pct']:
+                        all_quality_alerts.append(f"[{ds_name}] {col} 결측치 {v['pct']}%")
+                total_rows = ds_info['shape'][0]
+                for col, cnt in ds_info.get('outlier_detail', {}).items():
+                    pct = round(cnt / total_rows * 100, 1) if total_rows > 0 else 0
+                    if pct >= PromptEngine.QUALITY_THRESHOLDS['outlier_pct']:
+                        all_quality_alerts.append(f"[{ds_name}] {col} 이상치 {cnt}건 ({pct}%)")
+
+            quality_str = "\n".join(all_quality_alerts) if all_quality_alerts else "데이터 품질 양호"
+            datasets_section = "\n".join(all_stats_sections)
+            ds_names = ", ".join(matched_datasets.keys())
+
+            return f"""You are a sensor data analyst. Provide a concise 2-3 sentence insight.
 Use Korean terminology (백분위수, 평균, 중앙값, 표준편차, 상관계수, 이상치).
-When statistical significance is available (p-value), ALWAYS mention it explicitly (예: "p<0.05로 통계적으로 유의미", "95% 신뢰수준에서 유의미한 차이").
+When statistical significance is available (p-value), ALWAYS mention it explicitly.
+
+CRITICAL: This request involves MULTIPLE datasets: [{ds_names}].
+Use statistics from ALL relevant datasets below. Do NOT say data is unavailable when it is provided.
 
 User Request: "{user_request}"
-Dataset Shape: {dataset_info['shape']}
-Columns: {dataset_info['columns']}
+
+{datasets_section}
+
+Data Quality Alerts:
+{quality_str}
+
+Respond in Korean. Use actual numbers from the relevant datasets.
+If there are quality alerts, mention their potential impact.
+"""
+        else:
+            # 단일 데이터셋 매칭 또는 매칭 없음
+            if matched_datasets:
+                active_ds_name, (active_info, _) = max(matched_datasets.items(), key=lambda x: x[1][1])
+            else:
+                active_info = dataset_info
+                active_ds_name = "Primary"
+
+            # 품질 알림 메시지 동적 생성 (active_info 기준)
+            quality_alerts = []
+            missing_detail = active_info.get('missing_detail', {})
+            for col, v in missing_detail.items():
+                if v['pct'] >= PromptEngine.QUALITY_THRESHOLDS['missing_pct']:
+                    quality_alerts.append(f"{col} 컬럼 결측치 {v['pct']}% — 분석 신뢰도에 영향 가능")
+            outlier_detail = active_info.get('outlier_detail', {})
+            total_rows = active_info['shape'][0]
+            for col, cnt in outlier_detail.items():
+                pct = round(cnt / total_rows * 100, 1) if total_rows > 0 else 0
+                if pct >= PromptEngine.QUALITY_THRESHOLDS['outlier_pct']:
+                    quality_alerts.append(f"{col} 컬럼 이상치 {cnt}건 ({pct}%) — 분포 왜곡 가능")
+            dup_pct = active_info.get('dup_pct', 0)
+            if dup_pct >= PromptEngine.QUALITY_THRESHOLDS['duplicate_pct']:
+                quality_alerts.append(f"중복 행 {active_info.get('dup_count', 0)}건 ({dup_pct}%) — 밀도/빈도 왜곡 가능")
+            quality_str = "\n".join(quality_alerts) if quality_alerts else "데이터 품질 양호"
+
+            stat_tests_str = active_info.get('stat_tests_str', '통계 검정 없음')
+            return f"""You are a sensor data analyst. Provide a concise 2-3 sentence insight.
+Focus on: trends, anomalies, correlations, missing data patterns, and outliers.
+Use Korean terminology (백분위수, 평균, 중앙값, 표준편차, 상관계수, 이상치).
+When statistical significance is available (p-value), ALWAYS mention it explicitly.
+
+CRITICAL: Base your insight ONLY on variables mentioned in the user request.
+Do NOT mention variables from other datasets that are unrelated to the request.
+The relevant dataset for this request is: [{active_ds_name}]
+
+User Request: "{user_request}"
+Dataset: {active_ds_name}
+Shape: {active_info['shape']}
+Columns: {active_info['columns']}
 
 Statistical Summary:
-{dataset_info['describe_str']}
+{active_info['describe_str']}
 
-Missing Values: {dataset_info.get('missing_str', '결측치 없음')}
-Correlation: {dataset_info.get('corr_str', '상관계수 정보 없음')}
-Outliers (IQR): {dataset_info.get('outlier_str', '이상치 없음')}
-Duplicate Rows: {dataset_info.get('dup_count', 0)}건 ({dataset_info.get('dup_pct', 0)}%)
+Missing Values: {active_info.get('missing_str', '결측치 없음')}
+Correlation: {active_info.get('corr_str', '상관계수 정보 없음')}
+Outliers (IQR): {active_info.get('outlier_str', '이상치 없음')}
+Duplicate Rows: {active_info.get('dup_count', 0)}건 ({active_info.get('dup_pct', 0)}%)
 
-📊 Statistical Significance Tests (Pearson, |r|>0.3 기준):
+Statistical Significance Tests (Pearson, |r|>0.3 기준):
 {stat_tests_str}
 
 Data Quality Alerts:
 {quality_str}
 
-Respond in Korean. Be specific with actual numbers. Do NOT use English abbreviations like %tile.
+Respond in Korean. Be specific with actual numbers from the [{active_ds_name}] dataset only.
 If there are quality alerts above, mention them and explain their potential impact on the analysis.
 If statistical tests show p<0.05, explicitly state "통계적으로 유의미" in the insight.
 """
 
     @staticmethod
-    def build_recommendation_prompt(user_request: str, dataset_info: Dict) -> str:
+    def build_recommendation_prompt(user_request: str, dataset_info: Dict, datasets_info: Optional[Dict] = None) -> str:
+        # 멀티 데이터셋일 때 사용자 요청에 맞는 데이터셋 선택
+        active_info = dataset_info
+        if datasets_info and len(datasets_info) > 1:
+            request_lower = user_request.lower()
+            best_match_count = 0
+            for ds_name, ds_info in datasets_info.items():
+                cols = ds_info.get('columns', [])
+                match_count = sum(1 for col in cols if col.lower() in request_lower)
+                if match_count > best_match_count:
+                    best_match_count = match_count
+                    active_info = ds_info
+
         return f"""Based on the user's current visualization request and dataset, suggest 3 follow-up analysis questions.
 The questions should help the user explore the data more deeply.
 
@@ -889,10 +1035,10 @@ Rules:
 - Return ONLY 3 lines, one question per line. No numbering, no bullets, no explanation.
 
 User's current request: "{user_request}"
-Dataset columns: {dataset_info['columns']}
-Numeric columns: {dataset_info.get('numeric_columns', [])}
-Correlation: {dataset_info.get('corr_str', 'N/A')}
-Outliers: {dataset_info.get('outlier_str', 'N/A')}
+Dataset columns: {active_info['columns']}
+Numeric columns: {active_info.get('numeric_columns', [])}
+Correlation: {active_info.get('corr_str', 'N/A')}
+Outliers: {active_info.get('outlier_str', 'N/A')}
 """
 
     @staticmethod
@@ -1050,10 +1196,58 @@ class CodeValidator:
         return code
 
     @staticmethod
+    def fix_deprecated_plotly(code: str) -> str:
+        """Plotly deprecated 속성을 최신 문법으로 자동 치환"""
+        # titlefont=dict(...) → title=dict(font=dict(...))는 복잡하므로
+        # 단순히 titlefont → title_font 으로 치환 (update_layout/yaxis dict 내부)
+        code = re.sub(r'\btitlefont\b', 'title_font', code)
+        return code
+
+    @staticmethod
+    def fix_mixed_subplots(code: str) -> str:
+        """imshow + histogram 혼합 시 히트맵만 남기도록 변환, .show() 제거"""
+        # .show() 호출 제거 (Streamlit에서는 불필요하고 타임아웃 유발)
+        code = re.sub(r'\bfig\w*\.show\(\)', '', code)
+
+        has_imshow = 'px.imshow' in code or 'ff.create_annotated_heatmap' in code
+        has_histogram = 'px.histogram' in code or 'go.Histogram' in code
+        # 두 개의 fig 변수 생성 감지 (fig = ... 와 fig_xxx = ... 패턴)
+        multi_fig = len(re.findall(r'\b\w*fig\w*\s*=\s*(?:px\.|go\.)', code)) >= 2
+
+        if has_imshow and has_histogram and (multi_fig or 'make_subplots' in code):
+            return """import plotly.express as px
+import pandas as pd
+
+numeric_df = df.select_dtypes(include='number')
+corr_matrix = numeric_df.corr()
+
+fig = px.imshow(corr_matrix, text_auto='.3f', color_continuous_scale='RdBu_r',
+                zmin=-1, zmax=1, title='전체 변수 간 상관관계 히트맵',
+                labels=dict(color='상관계수'))
+fig.update_layout(dragmode='zoom')
+"""
+        return code
+
+    @staticmethod
+    def fix_interval_serialization(code: str) -> str:
+        """pd.cut/pd.qcut 결과가 Plotly JSON 직렬화 실패하는 문제 방지 — .astype(str) 자동 추가"""
+        if 'pd.cut' in code or 'pd.qcut' in code:
+            # pd.cut(...) 또는 pd.qcut(...) 결과를 할당하는 라인 뒤에 .astype(str) 추가
+            code = re.sub(
+                r"((\w+)\[(['\"])([\w가-힣]+)\3\]\s*=\s*pd\.(?:cut|qcut)\([^)]+\))",
+                r"\1\n\2[\3\4\3] = \2[\3\4\3].astype(str)",
+                code
+            )
+        return code
+
+    @staticmethod
     def full_check(raw_llm_output: str, available_columns: Optional[List[str]] = None, user_request: str = "") -> Tuple[str, bool, Optional[str]]:
         code = CodeValidator.extract_code_block(raw_llm_output)
         if user_request:
             code = CodeValidator.fix_scatter_code(code, user_request)
+        code = CodeValidator.fix_deprecated_plotly(code)
+        code = CodeValidator.fix_mixed_subplots(code)
+        code = CodeValidator.fix_interval_serialization(code)
         is_safe, msg = CodeValidator.validate(code, available_columns)
         return code, is_safe, msg
 
@@ -1147,6 +1341,18 @@ class CodeExecutor:
             if fig is None:
                 return None, "'fig' 변수가 생성되지 않았습니다."
             
+            # Plotly figure의 Interval 객체를 문자열로 변환 (pd.cut 결과 직렬화 오류 방지)
+            if _PLOTLY_AVAILABLE and hasattr(fig, 'data'):
+                for trace in fig.data:
+                    for attr in ('x', 'y', 'text'):
+                        vals = getattr(trace, attr, None)
+                        if vals is not None:
+                            try:
+                                converted = [str(v) if hasattr(v, 'left') else v for v in vals]
+                                setattr(trace, attr, converted)
+                            except (TypeError, AttributeError):
+                                pass
+
             # Plotly figure의 shape/annotation 개수 제한 (브라우저 렌더링 멈춤 방지)
             if _PLOTLY_AVAILABLE and hasattr(fig, 'layout'):
                 n_shapes = len(fig.layout.shapes) if fig.layout.shapes else 0
@@ -1956,7 +2162,7 @@ if prompt:
         else:
             # 인사이트 생성
             try:
-                insight_prompt = PromptEngine.build_insight_prompt(prompt, dataset_info)
+                insight_prompt = PromptEngine.build_insight_prompt(prompt, dataset_info, datasets_info=datasets_info)
                 insight = llm_client.generate(
                     system_prompt="You are a sensor data analyst. Answer concisely in Korean.",
                     user_prompt=insight_prompt,
@@ -1967,7 +2173,7 @@ if prompt:
             # 추천 질문 생성
             recommendations = []
             try:
-                rec_prompt = PromptEngine.build_recommendation_prompt(prompt, dataset_info)
+                rec_prompt = PromptEngine.build_recommendation_prompt(prompt, dataset_info, datasets_info=datasets_info)
                 rec_raw = llm_client.generate(
                     system_prompt="You suggest follow-up data analysis questions in Korean.",
                     user_prompt=rec_prompt,
