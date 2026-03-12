@@ -3,8 +3,8 @@
 > **⚠️ 현재 Demo 버전입니다.**  
 > EL_Sensor, EL_Vibration 샘플 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
 
-Dataiku DSS 웹앱(Streamlit) 기반 LLM 데이터 시각화·분석 도구.  
-Dataiku 프로젝트 내 데이터셋을 자연어로 질문하면 Plotly 인터랙티브 차트와 인사이트를 자동 생성합니다.
+Dataiku DSS 웹앱(Streamlit) 기반의 대화형 데이터 분석 도구.  
+사용자의 자연어 질의를 LLM이 해석하여 Python 분석 코드를 자동 생성·실행하고, Plotly 인터랙티브 차트와 통계 인사이트를 제공합니다.
 
 ---
 
