@@ -193,13 +193,15 @@ class DataikuManager:
         except Exception as e:
             raise RuntimeError(f"데이터셋 목록 조회 실패: {str(e)}")
 
-    def load_dataset(self, name: str, limit: int = 50000) -> pd.DataFrame:
+    def load_dataset(self, name: str, limit: int = 0) -> pd.DataFrame:
         if not self._in_dataiku:
             return self._demo_dataframe(name)
         try:
             import dataiku
             dataset = dataiku.Dataset(name)
-            return dataset.get_dataframe(limit=limit)
+            if limit > 0:
+                return dataset.get_dataframe(limit=limit)
+            return dataset.get_dataframe()
         except Exception as e:
             raise RuntimeError(f"데이터셋 '{name}' 로드 실패: {str(e)}")
 
@@ -1061,8 +1063,20 @@ class CodeValidator:
 # ================================================================
 
 class CodeExecutor:
+    # 실행 결과 캐시: {hash(code + df_shape): (fig, error)}
+    _result_cache: Dict[str, Tuple[Optional[Any], Optional[str]]] = {}
+
+    @staticmethod
+    def _make_cache_key(code: str, df: pd.DataFrame) -> str:
+        import hashlib
+        content = f"{code}|{df.shape}|{list(df.columns)}"
+        return hashlib.md5(content.encode()).hexdigest()
+
     @staticmethod
     def execute(code: str, df: pd.DataFrame, datasets: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Optional[Any], Optional[str]]:
+        cache_key = CodeExecutor._make_cache_key(code, df)
+        if cache_key in CodeExecutor._result_cache:
+            return CodeExecutor._result_cache[cache_key]
         plt.close("all")
         namespace: dict = {
             "df": df,
@@ -1147,19 +1161,33 @@ class CodeExecutor:
                 if n_annotations > 50:
                     return None, f"⚠️ Annotation이 {n_annotations}개 생성되어 브라우저가 멈출 수 있습니다. 개수를 줄여주세요."
             
-            return fig, None
+            result = fig, None
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except KeyError as e:
-            return None, f"컬럼을 찾을 수 없습니다: {e}\n사용 가능한 컬럼: {df.columns.tolist()}"
+            result = None, f"컬럼을 찾을 수 없습니다: {e}\n사용 가능한 컬럼: {df.columns.tolist()}"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except ValueError as e:
-            return None, f"값 오류: {str(e)}"
+            result = None, f"값 오류: {str(e)}"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except TypeError as e:
-            return None, f"타입 오류: {str(e)}"
+            result = None, f"타입 오류: {str(e)}"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except AttributeError as e:
-            return None, f"속성 오류: {str(e)}\n(객체에 해당 메서드/속성이 없습니다)"
+            result = None, f"속성 오류: {str(e)}\n(객체에 해당 메서드/속성이 없습니다)"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except NameError as e:
-            return None, f"변수명 오류: {str(e)}\n(정의되지 않은 변수를 사용했습니다)"
+            result = None, f"변수명 오류: {str(e)}\n(정의되지 않은 변수를 사용했습니다)"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
         except Exception as e:
-            return None, f"실행 오류 ({type(e).__name__}): {str(e)}\n\n{traceback.format_exc()}"
+            result = None, f"실행 오류 ({type(e).__name__}): {str(e)}\n\n{traceback.format_exc()}"
+            CodeExecutor._result_cache[cache_key] = result
+            return result
 
     @staticmethod
     def is_plotly_figure(fig: Any) -> bool:
@@ -1173,6 +1201,47 @@ class CodeExecutor:
     @staticmethod
     def is_matplotlib_figure(fig: Any) -> bool:
         return isinstance(fig, matplotlib.figure.Figure)
+
+
+# ================================================================
+# Error Retry Guide
+# ================================================================
+
+def _build_error_guide(error_msg: str, dataset_info: Optional[Dict] = None) -> str:
+    """에러 메시지를 분석해서 사용자에게 재시도 가이드를 생성"""
+    guide_lines = []
+
+    if "컬럼을 찾을 수 없습니다" in error_msg or "존재하지 않는 컬럼" in error_msg:
+        cols = ", ".join(dataset_info.get("columns", [])) if dataset_info else ""
+        guide_lines.append("사용 가능한 컬럼명을 확인하고 정확한 이름으로 다시 요청해보세요.")
+        if cols:
+            guide_lines.append(f"현재 컬럼: {cols}")
+
+    elif "시간 초과" in error_msg or "timeout" in error_msg.lower():
+        guide_lines.append("데이터가 너무 크거나 연산이 복잡합니다.")
+        guide_lines.append("'상위 1000개만', '샘플링해서' 같은 조건을 추가해보세요.")
+
+    elif "문법 오류" in error_msg or "SyntaxError" in error_msg:
+        guide_lines.append("LLM이 잘못된 코드를 생성했습니다. 요청을 더 구체적으로 바꿔보세요.")
+        guide_lines.append("예: '산점도로 x1과 x2의 관계를 보여줘' 처럼 차트 유형을 명시하면 정확도가 올라갑니다.")
+
+    elif "보안 위반" in error_msg or "허용되지 않은 모듈" in error_msg:
+        guide_lines.append("허용되지 않은 기능이 포함된 코드가 생성되었습니다.")
+        guide_lines.append("시각화 관련 요청으로 다시 시도해보세요.")
+
+    elif "fig" in error_msg and "생성되지 않았습니다" in error_msg:
+        guide_lines.append("차트 생성에 실패했습니다. 요청을 더 명확하게 해보세요.")
+        guide_lines.append("예: 'x1의 히스토그램을 그려줘', 'ID별 x2 추이를 보여줘'")
+
+    elif "Shape" in error_msg or "Annotation" in error_msg:
+        guide_lines.append("차트 요소가 너무 많아 브라우저가 멈출 수 있습니다.")
+        guide_lines.append("'상위 10개만', '요약해서' 같은 조건을 추가해보세요.")
+
+    else:
+        guide_lines.append("요청을 더 구체적으로 바꿔서 다시 시도해보세요.")
+        guide_lines.append("차트 유형(산점도, 히스토그램, 박스플롯 등)과 컬럼명을 명시하면 성공률이 높아집니다.")
+
+    return "\n".join(guide_lines)
 
 
 # ================================================================
@@ -1327,7 +1396,7 @@ def _load_api_key(provider: str) -> Optional[str]:
 
 st.set_page_config(
     page_title="NexusData | LLM Dashboard",
-    page_icon="📊",
+    page_icon="N",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -1398,6 +1467,21 @@ st.markdown("""
         border-bottom: 2px solid #2d6a9f;
         padding-bottom: 0.5rem;
     }
+
+    /* 코드 블록 높이 제한 해제 */
+    .stCode, .stCode > div, .stCode pre {
+        max-height: none !important;
+        overflow: visible !important;
+    }
+
+    /* 코드 블록 줄바꿈 */
+    .stCode pre, .stCode code {
+        white-space: pre-wrap !important;
+        word-break: break-all !important;
+        overflow-x: hidden !important;
+    }
+
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1433,16 +1517,12 @@ _init_session()
 # ================================================================
 
 with st.sidebar:
-    st.markdown("# 🔷 NexusData")
+    st.markdown("# 📊 NexusData")
     st.markdown("---")
+    
+    # 대화 히스토리 헤더 + 새 채팅 아이콘 버튼
     st.markdown("### 대화 히스토리")
-    
-    # 히스토리 관리
-    history_manager = st.session_state.history_manager
-    user_id = st.session_state.user_id
-    
-    # 새 채팅 버튼
-    if st.button("+ 새 채팅", use_container_width=True):
+    if st.button("✏️ 새 채팅", use_container_width=True):
         st.session_state.messages = []
         st.session_state.df = None
         st.session_state.dataset_info = None
@@ -1450,7 +1530,9 @@ with st.sidebar:
         st.session_state.prompt_key_counter = st.session_state.get('prompt_key_counter', 0) + 1
         st.rerun()
     
-    st.markdown("---")
+    # 히스토리 관리
+    history_manager = st.session_state.history_manager
+    user_id = st.session_state.user_id
     
     # 저장된 히스토리 목록 (Gemini 스타일)
     histories = history_manager.list_user_histories(user_id)
@@ -1484,7 +1566,7 @@ with st.sidebar:
                     user_prompt = prev.get("content", "")[:30] + "..." if len(prev.get("content", "")) > 30 else prev.get("content", "")
                 with st.expander(f"#{i+1} {user_prompt}", expanded=False):
                     st.code(m["code"], language="python")
-                    if st.button("🔄 재실행", key=f"rerun_{msg_idx}_{i}"):
+                    if st.button("재실행", key=f"rerun_{msg_idx}_{i}"):
                         if user_prompt:
                             st.session_state.pending_prompt = st.session_state.messages[msg_idx - 1].get("content", "")
                             st.rerun()
@@ -1501,7 +1583,7 @@ if st.session_state.df is not None:
     loaded_datasets = st.session_state.get("datasets", {})
     
     if len(loaded_datasets) > 1:
-        # 멀티 데이터셋: 탭으로 표시
+        # 멀티 데이터셋: 탭으로 표시 + 탭별 품질 리포트
         st.markdown("### 데이터 미리보기")
         tabs = st.tabs(list(loaded_datasets.keys()))
         for tab, (ds_name, ds_df) in zip(tabs, loaded_datasets.items()):
@@ -1513,6 +1595,33 @@ if st.session_state.df is not None:
                         f"**컬럼**: {', '.join(ds_info['columns'])}  |  "
                         f"**행**: {ds_info['shape'][0]:,}  |  **열**: {ds_info['shape'][1]}"
                     )
+                    with st.expander("데이터 품질 리포트", expanded=False):
+                        q_col1, q_col2, q_col3 = st.columns(3)
+                        missing_detail = ds_info.get("missing_detail", {})
+                        total_missing = sum(v["count"] for v in missing_detail.values()) if missing_detail else 0
+                        with q_col1:
+                            if total_missing == 0:
+                                st.metric("결측치", "0건", delta="양호", delta_color="normal")
+                            else:
+                                st.metric("결측치", f"{total_missing:,}건", delta="주의", delta_color="inverse")
+                                for col, v in missing_detail.items():
+                                    st.caption(f"`{col}`: {v['count']:,}건 ({v['pct']}%)")
+                        outlier_detail = ds_info.get("outlier_detail", {})
+                        total_outliers = sum(outlier_detail.values()) if outlier_detail else 0
+                        with q_col2:
+                            if total_outliers == 0:
+                                st.metric("이상치 (IQR)", "0건", delta="양호", delta_color="normal")
+                            else:
+                                st.metric("이상치 (IQR)", f"{total_outliers:,}건", delta="확인 필요", delta_color="inverse")
+                                for col, cnt in outlier_detail.items():
+                                    st.caption(f"`{col}`: {cnt:,}건")
+                        dup_count = ds_info.get("dup_count", 0)
+                        dup_pct = ds_info.get("dup_pct", 0)
+                        with q_col3:
+                            if dup_count == 0:
+                                st.metric("중복 행", "0건", delta="양호", delta_color="normal")
+                            else:
+                                st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
     else:
         # 단일 데이터셋
         st.markdown("### 데이터 미리보기")
@@ -1529,40 +1638,38 @@ if st.session_state.df is not None:
             f"**행**: {info['shape'][0]:,}  |  **열**: {info['shape'][1]}"
         )
 
-    # ── 데이터 품질 리포트 ──
-    with st.expander("데이터 품질 리포트", expanded=False):
-        q_col1, q_col2, q_col3 = st.columns(3)
+    # ── 데이터 품질 리포트 (단일 데이터셋만) ──
+    if len(loaded_datasets) <= 1:
+        with st.expander("데이터 품질 리포트", expanded=False):
+            q_col1, q_col2, q_col3 = st.columns(3)
 
-        # 결측치
-        missing_detail = info.get("missing_detail", {})
-        total_missing = sum(v["count"] for v in missing_detail.values()) if missing_detail else 0
-        with q_col1:
-            if total_missing == 0:
-                st.metric("결측치", "0건", delta="양호", delta_color="normal")
-            else:
-                st.metric("결측치", f"{total_missing:,}건", delta="주의 ⚠️", delta_color="inverse")
-                for col, v in missing_detail.items():
-                    st.caption(f"  `{col}`: {v['count']:,}건 ({v['pct']}%)")
+            missing_detail = info.get("missing_detail", {})
+            total_missing = sum(v["count"] for v in missing_detail.values()) if missing_detail else 0
+            with q_col1:
+                if total_missing == 0:
+                    st.metric("결측치", "0건", delta="양호", delta_color="normal")
+                else:
+                    st.metric("결측치", f"{total_missing:,}건", delta="주의", delta_color="inverse")
+                    for col, v in missing_detail.items():
+                        st.caption(f"`{col}`: {v['count']:,}건 ({v['pct']}%)")
 
-        # 이상치
-        outlier_detail = info.get("outlier_detail", {})
-        total_outliers = sum(outlier_detail.values()) if outlier_detail else 0
-        with q_col2:
-            if total_outliers == 0:
-                st.metric("이상치 (IQR)", "0건", delta="양호", delta_color="normal")
-            else:
-                st.metric("이상치 (IQR)", f"{total_outliers:,}건", delta="확인 필요", delta_color="inverse")
-                for col, cnt in outlier_detail.items():
-                    st.caption(f"  `{col}`: {cnt:,}건")
+            outlier_detail = info.get("outlier_detail", {})
+            total_outliers = sum(outlier_detail.values()) if outlier_detail else 0
+            with q_col2:
+                if total_outliers == 0:
+                    st.metric("이상치 (IQR)", "0건", delta="양호", delta_color="normal")
+                else:
+                    st.metric("이상치 (IQR)", f"{total_outliers:,}건", delta="확인 필요", delta_color="inverse")
+                    for col, cnt in outlier_detail.items():
+                        st.caption(f"`{col}`: {cnt:,}건")
 
-        # 중복
-        dup_count = info.get("dup_count", 0)
-        dup_pct = info.get("dup_pct", 0)
-        with q_col3:
-            if dup_count == 0:
-                st.metric("중복 행", "0건", delta="양호", delta_color="normal")
-            else:
-                st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
+            dup_count = info.get("dup_count", 0)
+            dup_pct = info.get("dup_pct", 0)
+            with q_col3:
+                if dup_count == 0:
+                    st.metric("중복 행", "0건", delta="양호", delta_color="normal")
+                else:
+                    st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
 
     st.markdown("---")
 
@@ -1582,17 +1689,19 @@ for msg in st.session_state.messages:
                     st.pyplot(fig, use_container_width=True)
             if msg.get("insight"):
                 st.info(f"**인사이트**: {msg['insight']}")
-            if msg.get("code"):
-                with st.expander("코드", expanded=False):
-                    st.code(msg["code"], language="python")
-            # 다운로드 버튼 (차트 + 보고서)
+            # 코드 보기 (전체 너비)
             msg_idx = st.session_state.messages.index(msg)
             _has_fig = msg.get("fig") is not None
+            _has_code = bool(msg.get("code"))
             _has_insight = bool(msg.get("insight"))
+            if _has_code:
+                with st.expander("코드 보기", expanded=False):
+                    st.code(msg["code"], language="python")
+            # 다운로드 버튼 2개 나란히
             if _has_fig or _has_insight:
                 _dl_col1, _dl_col2 = st.columns(2)
-                if _has_fig and CodeExecutor.is_plotly_figure(msg["fig"]):
-                    with _dl_col1:
+                with _dl_col1:
+                    if _has_fig and CodeExecutor.is_plotly_figure(msg["fig"]):
                         try:
                             _html_bytes = msg["fig"].to_html(include_plotlyjs='cdn').encode('utf-8')
                             st.download_button(
@@ -1605,8 +1714,8 @@ for msg in st.session_state.messages:
                             )
                         except Exception:
                             pass
-                if _has_insight:
-                    with _dl_col2:
+                with _dl_col2:
+                    if _has_insight:
                         _report_lines = [
                             f"# NexusData 분석 보고서",
                             f"",
@@ -1621,10 +1730,9 @@ for msg in st.session_state.messages:
                             f"{msg.get('code', '')}",
                             f"```",
                         ]
-                        _report_text = "\n".join(_report_lines)
                         st.download_button(
                             "보고서 다운로드 (TXT)",
-                            _report_text.encode('utf-8'),
+                            "\n".join(_report_lines).encode('utf-8'),
                             file_name=f"report_{msg_idx}.txt",
                             mime="text/plain",
                             key=f"dl_report_{msg_idx}",
@@ -1632,11 +1740,14 @@ for msg in st.session_state.messages:
                         )
             if msg.get("error"):
                 st.error(msg["error"])
+                retry_guide = _build_error_guide(msg["error"], st.session_state.dataset_info)
+                st.warning(f"다시 시도하려면:\n{retry_guide}")
             if msg.get("recommendations"):
                 st.markdown("**💡 추천 질문:**")
                 for i, rec in enumerate(msg["recommendations"]):
                     msg_idx = st.session_state.messages.index(msg)
-                    if st.button(f"👉 {rec}", key=f"rec_{msg_idx}_{i}"):
+                    icons = ["📈", "🔍", "📊"]
+                    if st.button(f"{icons[i % 3]} {rec}", key=f"rec_{msg_idx}_{i}"):
                         st.session_state.pending_prompt = rec
                         st.rerun()
 
@@ -1724,7 +1835,7 @@ with col2:
                     loaded_datasets = {}
                     loaded_infos = {}
                     for ds_name in selected_datasets:
-                        df_loaded = data_manager.load_dataset(ds_name, limit=50000)
+                        df_loaded = data_manager.load_dataset(ds_name)
                         loaded_datasets[ds_name] = df_loaded
                         loaded_infos[ds_name] = data_manager.build_dataset_info(df_loaded)
                     
