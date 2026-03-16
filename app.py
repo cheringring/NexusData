@@ -18,9 +18,6 @@ from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -61,21 +58,30 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-
-_OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-_GROQ_API_KEY      = os.getenv("GROQ_API_KEY")
+_OPENAI_API_KEY    = "OPENAI_KEY_REMOVED"
+_ANTHROPIC_API_KEY = "여기에_Anthropic_API_KEY_입력"  # sk-ant-...
+_GROQ_API_KEY      = "GROQ_KEY_REMOVED"  
 # ================================================================
 # HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
 
 class HistoryManager:
-    """사용자별 채팅 히스토리를 JSON 파일로 저장/복원"""
-    
+    """사용자별 채팅 히스토리를 Managed Folder(Dataiku) 또는 로컬 JSON으로 저장/복원"""
+
+    FOLDER_NAME = "nexusdata_charts"
+    HISTORY_PREFIX = "_history"  # Managed Folder 내 경로: _history/{user_id}_{dataset}.json
+
     def __init__(self, storage_dir: str = ".chat_history"):
         self.storage_dir = storage_dir
-        os.makedirs(storage_dir, exist_ok=True)
-    
+        self._in_dataiku = False
+        self._folder = None
+        try:
+            import dataiku
+            self._folder = dataiku.Folder(self.FOLDER_NAME)
+            self._in_dataiku = True
+        except Exception:
+            os.makedirs(storage_dir, exist_ok=True)
+
     @staticmethod
     def get_user_id() -> str:
         """Dataiku 사용자 ID 가져오기 (없으면 'default')"""
@@ -86,17 +92,18 @@ class HistoryManager:
             return auth_info.get("authIdentifier", "default")
         except Exception:
             return "default"
-    
+
+    def _folder_path(self, user_id: str, dataset_name: str) -> str:
+        safe_ds_name = re.sub(r'[^\w\-]', '_', dataset_name)
+        return f"{self.HISTORY_PREFIX}/{user_id}_{safe_ds_name}.json"
+
     def get_history_file(self, user_id: str, dataset_name: str) -> str:
-        """사용자 + 데이터셋별 히스토리 파일 경로"""
         safe_ds_name = re.sub(r'[^\w\-]', '_', dataset_name)
         return os.path.join(self.storage_dir, f"{user_id}_{safe_ds_name}.json")
-    
+
     def save_history(self, user_id: str, dataset_name: str, messages: List[dict], title: str = None) -> bool:
         """히스토리 저장"""
         try:
-            filepath = self.get_history_file(user_id, dataset_name)
-            # 제목 자동 생성: 데이터셋명(들) + 첫 프롬프트
             if title is None:
                 first_user_msg = next((m.get('content', '') for m in messages if m.get('role') == 'user'), '')
                 short_msg = first_user_msg[:20] + ('...' if len(first_user_msg) > 20 else '')
@@ -108,53 +115,86 @@ class HistoryManager:
                 "last_updated": datetime.now().isoformat(),
                 "messages": messages
             }
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+            if self._in_dataiku and self._folder:
+                self._folder.upload_stream(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
+            else:
+                filepath = self.get_history_file(user_id, dataset_name)
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(payload.decode("utf-8"))
             return True
         except Exception as e:
             print(f"히스토리 저장 실패: {e}")
             return False
-    
+
     def load_history(self, user_id: str, dataset_name: str) -> List[dict]:
         """히스토리 복원"""
         try:
-            filepath = self.get_history_file(user_id, dataset_name)
-            if not os.path.exists(filepath):
-                return []
-            
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            return data.get("messages", [])
+            if self._in_dataiku and self._folder:
+                path = self._folder_path(user_id, dataset_name)
+                try:
+                    with self._folder.get_download_stream(path) as f:
+                        data = json.loads(f.read().decode("utf-8"))
+                    return data.get("messages", [])
+                except Exception:
+                    return []
+            else:
+                filepath = self.get_history_file(user_id, dataset_name)
+                if not os.path.exists(filepath):
+                    return []
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                return data.get("messages", [])
         except Exception as e:
             print(f"히스토리 로드 실패: {e}")
             return []
-    
+
     def list_user_histories(self, user_id: str) -> List[dict]:
         """사용자의 모든 히스토리 목록"""
         try:
             histories = []
-            for filename in os.listdir(self.storage_dir):
-                if filename.startswith(f"{user_id}_") and filename.endswith(".json"):
-                    filepath = os.path.join(self.storage_dir, filename)
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    histories.append({
-                        "dataset": data.get("dataset"),
-                        "title": data.get("title", data.get("dataset", "")),
-                        "last_updated": data.get("last_updated"),
-                        "message_count": len(data.get("messages", []))
-                    })
-            return sorted(histories, key=lambda x: x["last_updated"], reverse=True)
+            if self._in_dataiku and self._folder:
+                prefix = f"{self.HISTORY_PREFIX}/{user_id}_"
+                for path in self._folder.list_paths_in_partition():
+                    if path.startswith(prefix) and path.endswith(".json"):
+                        try:
+                            with self._folder.get_download_stream(path) as f:
+                                data = json.loads(f.read().decode("utf-8"))
+                            histories.append({
+                                "dataset": data.get("dataset"),
+                                "title": data.get("title", data.get("dataset", "")),
+                                "last_updated": data.get("last_updated"),
+                                "message_count": len(data.get("messages", []))
+                            })
+                        except Exception:
+                            continue
+            else:
+                for filename in os.listdir(self.storage_dir):
+                    if filename.startswith(f"{user_id}_") and filename.endswith(".json"):
+                        filepath = os.path.join(self.storage_dir, filename)
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        histories.append({
+                            "dataset": data.get("dataset"),
+                            "title": data.get("title", data.get("dataset", "")),
+                            "last_updated": data.get("last_updated"),
+                            "message_count": len(data.get("messages", []))
+                        })
+            return sorted(histories, key=lambda x: x.get("last_updated", ""), reverse=True)
         except Exception:
             return []
-    
+
     def delete_history(self, user_id: str, dataset_name: str) -> bool:
         """히스토리 삭제"""
         try:
-            filepath = self.get_history_file(user_id, dataset_name)
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            if self._in_dataiku and self._folder:
+                path = self._folder_path(user_id, dataset_name)
+                self._folder.delete_path(path)
+            else:
+                filepath = self.get_history_file(user_id, dataset_name)
+                if os.path.exists(filepath):
+                    os.remove(filepath)
             return True
         except Exception:
             return False
@@ -332,6 +372,199 @@ class DataikuManager:
             "category": np.random.choice(["Electronics", "Clothing", "Food", "Sports"], n),
             "units": np.random.randint(1, 200, n),
         })
+
+
+# ================================================================
+# DataikuFlowExporter - 분석 결과를 Dataiku Flow 자산으로 내보내기
+# ================================================================
+
+class DataikuFlowExporter:
+    """
+    Streamlit 웹앱의 비정형 분석 결과를 Dataiku Flow 자산으로 게시.
+
+    Flow 구조:
+    └── 📁 Managed Folder: "nexusdata_charts"
+          └── {user_id}/{insight_id}.json  (질의/코드/인사이트 메타)
+          + Dataiku Static Insight → 대시보드 타일 자동 추가
+    """
+
+    MANAGED_FOLDER_NAME = "nexusdata_charts"
+
+    def __init__(self, data_manager: DataikuManager):
+        self._dm = data_manager
+        self._in_dataiku = data_manager.is_connected
+        if self._in_dataiku:
+            self._ensure_assets_exist()
+
+    def _ensure_assets_exist(self):
+        """Managed Folder + Dataset 자동 생성"""
+        try:
+            import dataiku
+            client = dataiku.api_client()
+            project = client.get_default_project()
+
+            # ── Managed Folder 자동 생성 ──
+            existing_folders = [f["name"] for f in project.list_managed_folders()]
+            if self.MANAGED_FOLDER_NAME not in existing_folders:
+                project.create_managed_folder(self.MANAGED_FOLDER_NAME)
+                print(f"[FlowExporter] Managed Folder '{self.MANAGED_FOLDER_NAME}' 생성 완료")
+
+        except Exception as e:
+            print(f"[FlowExporter] 자산 자동 생성 중 오류 (무시됨): {e}")
+
+    def publish_chart(self, user_id: str, fig, code: str, question: str,
+                      insight: str = "", dataset_name: str = "",
+                      chart_type: str = "plotly") -> Tuple[bool, str]:
+        """LLM 생성 차트를 Dataiku Static Insight로 게시 → 대시보드에서 바로 확인 가능"""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        insight_id = f"nexusdata_{user_id}_{ts}"
+
+        # 차트 제목 추출 (fig.layout.title)
+        chart_title = ""
+        try:
+            if hasattr(fig, 'layout') and hasattr(fig.layout, 'title'):
+                t = fig.layout.title
+                if isinstance(t, str):
+                    chart_title = t
+                elif hasattr(t, 'text') and t.text:
+                    chart_title = t.text
+        except Exception:
+            pass
+        label = f"NexusData: {chart_title}" if chart_title else f"NexusData: {question[:50]}"
+
+        if self._in_dataiku:
+            try:
+                import dataiku
+                import dataiku.insights
+                client = dataiku.api_client()
+                project = client.get_default_project()
+
+                # ── 1) Static Insight 게시 ──
+                if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
+                    # Plotly figure → save_plotly (HTML 자동 변환)
+                    dataiku.insights.save_plotly(insight_id, fig, label=label)
+                elif hasattr(fig, 'savefig'):
+                    # Matplotlib figure → save_figure
+                    dataiku.insights.save_figure(insight_id, fig, label=label)
+                else:
+                    return False, "지원하지 않는 차트 타입"
+
+                # ── 2) Managed Folder에 메타 JSON 저장 ──
+                try:
+                    folder = dataiku.Folder(self.MANAGED_FOLDER_NAME)
+
+                    meta = {
+                        "user_id": user_id,
+                        "timestamp": datetime.now().isoformat(),
+                        "dataset": dataset_name,
+                        "question": question,
+                        "code": code,
+                        "insight": insight,
+                        "chart_type": chart_type,
+                        "insight_id": insight_id,
+                        "label": label,
+                    }
+                    folder.upload_stream(
+                        f"{user_id}/{insight_id}.json",
+                        io.BytesIO(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+                    )
+                except Exception as e:
+                    print(f"[FlowExporter] Managed Folder 저장 실패 (무시): {e}")
+
+                # ── 3) 대시보드에 Insight 타일 자동 추가 ──
+                try:
+                    self._add_insight_to_dashboard(project, insight_id, label)
+                except Exception as e:
+                    print(f"[FlowExporter] 대시보드 타일 추가 실패: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                return True, f"대시보드 게시 완료 : {label}"
+            except Exception as e:
+                return False, f"대시보드 게시 실패: {str(e)}"
+        else:
+            # 로컬 폴백
+            local_dir = os.path.join(".nexusdata_charts", user_id)
+            os.makedirs(local_dir, exist_ok=True)
+            local_path = os.path.join(local_dir, f"{insight_id}.html")
+            if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
+                with open(local_path, "w", encoding="utf-8") as f:
+                    f.write(fig.to_html(include_plotlyjs="cdn", full_html=True))
+            return True, f"로컬 저장 완료: {local_path}"
+
+    DASHBOARD_NAME = "NexusData Dashboard"
+
+    def _add_insight_to_dashboard(self, project, insight_id: str, label: str):
+        """NexusData 대시보드에 Insight 타일 자동 추가 (없으면 대시보드 생성)"""
+        import dataiku
+        client = dataiku.api_client()
+        project_key = project.project_key
+
+        # 대시보드 찾기
+        dashboard = None
+        for d in project.list_dashboards():
+            if "nexusdata" in d.name.lower():
+                dashboard = d.to_dashboard()
+                break
+
+        # 대시보드 없으면 생성
+        if dashboard is None:
+            print(f"[FlowExporter] 대시보드 '{self.DASHBOARD_NAME}' 생성 시도...")
+            dashboard = project.create_dashboard(self.DASHBOARD_NAME)
+            print(f"[FlowExporter] 대시보드 생성 완료: {dashboard.get_settings().id}")
+
+        settings = dashboard.get_settings()
+        raw = settings.get_raw()
+        pages = raw.get("pages", [])
+
+        # 첫 번째 페이지가 없으면 추가
+        if not pages:
+            pages.append({"title": "분석 차트", "grid": {"tiles": []}})
+            raw["pages"] = pages
+
+        page = pages[0]
+        if "grid" not in page:
+            page["grid"] = {"tiles": []}
+        grid = page["grid"]
+        if "tiles" not in grid:
+            grid["tiles"] = []
+        tiles = grid["tiles"]
+
+        # 이미 같은 insight가 있으면 스킵
+        for t in tiles:
+            if t.get("insightId") == insight_id:
+                print(f"[FlowExporter] 이미 대시보드에 존재: {insight_id}")
+                return
+
+        # 타일 위치 계산 (12열 그리드 기준, 아래로 쌓기)
+        max_row = 0
+        for t in tiles:
+            box = t.get("box", {})
+            bottom = box.get("top", 0) + box.get("height", 4)
+            if bottom > max_row:
+                max_row = bottom
+
+        new_tile = {
+            "insightId": insight_id,
+            "insightType": "static_file",
+            "tileType": "INSIGHT",
+            "title": label,
+            "autoTitle": False,
+            "box": {
+                "left": 0,
+                "top": max_row,
+                "width": 12,
+                "height": 10,
+            },
+            "tileParams": {},
+            "clickAction": "DO_NOTHING",
+            "resizeImageMode": "FIT_SIZE",
+            "displayMode": "INSIGHT",
+        }
+        tiles.append(new_tile)
+        settings.save()
+        print(f"[FlowExporter] 대시보드 타일 추가 완료: {label}")
+
 
 
 # ================================================================
@@ -1707,6 +1940,7 @@ def _init_session():
         "error_count": 0,        # 현재 메시지의 오류 횟수
         "history_manager": HistoryManager(),  # 히스토리 관리자
         "user_id": HistoryManager.get_user_id(),  # 현재 사용자 ID
+        "flow_exporter": None,   # DataikuFlowExporter 인스턴스
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1724,6 +1958,16 @@ _init_session()
 
 with st.sidebar:
     st.markdown("# 📊 NexusData")
+
+    # 솔루션 선택
+    solution_list = ["Dataiku", "솔루션1", "솔루션2"]
+    selected_solution = st.selectbox(
+        "솔루션",
+        solution_list,
+        index=0,
+        key="selected_solution",
+    )
+
     st.markdown("---")
     
     # 대화 히스토리 헤더 + 새 채팅 아이콘 버튼
@@ -1783,6 +2027,10 @@ with st.sidebar:
 
 # DataikuManager 초기화
 data_manager = DataikuManager()
+
+# FlowExporter 초기화
+if st.session_state.flow_exporter is None:
+    st.session_state.flow_exporter = DataikuFlowExporter(data_manager)
 
 # ── 1) 데이터 미리보기 ──
 if st.session_state.df is not None:
@@ -1903,59 +2151,27 @@ for msg in st.session_state.messages:
             if _has_code:
                 with st.expander("코드 보기", expanded=False):
                     st.code(msg["code"], language="python")
-            # 다운로드 버튼 2개 나란히
-            if _has_fig or _has_insight:
-                _dl_col1, _dl_col2 = st.columns(2)
-                with _dl_col1:
-                    if _has_fig and CodeExecutor.is_plotly_figure(msg["fig"]):
-                        try:
-                            _html_bytes = msg["fig"].to_html(include_plotlyjs='cdn').encode('utf-8')
-                            st.download_button(
-                                "차트 다운로드 (HTML)",
-                                _html_bytes,
-                                file_name=f"chart_{msg_idx}.html",
-                                mime="text/html",
-                                key=f"dl_chart_{msg_idx}",
-                                use_container_width=True,
-                            )
-                        except Exception:
-                            pass
-                with _dl_col2:
-                    if _has_insight:
-                        _report_lines = [
-                            f"# NexusData 분석 보고서",
-                            f"",
-                            f"## 요청",
-                            f"{st.session_state.messages[msg_idx-1].get('content','') if msg_idx > 0 else ''}",
-                            f"",
-                            f"## 인사이트",
-                            f"{msg.get('insight', '')}",
-                            f"",
-                            f"## 생성 코드",
-                            f"```python",
-                            f"{msg.get('code', '')}",
-                            f"```",
-                        ]
-                        st.download_button(
-                            "보고서 다운로드 (TXT)",
-                            "\n".join(_report_lines).encode('utf-8'),
-                            file_name=f"report_{msg_idx}.txt",
-                            mime="text/plain",
-                            key=f"dl_report_{msg_idx}",
-                            use_container_width=True,
+            # Flow 연동 버튼: 대시보드 게시 (JSON 메타 + Insight + 대시보드 타일)
+            if _has_fig:
+                if st.session_state.get("flow_exporter"):
+                    if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
+                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                        _ds_name = st.session_state.selected_dataset or ''
+                        _exporter = st.session_state.flow_exporter
+                        _uid = st.session_state.user_id
+                        ok_chart, chart_msg = _exporter.publish_chart(
+                            user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
+                            question=_user_q, insight=msg.get("insight", ""),
+                            dataset_name=_ds_name,
                         )
+                        if ok_chart:
+                            st.success(chart_msg)
+                        else:
+                            st.error(chart_msg)
             if msg.get("error"):
                 st.error(msg["error"])
                 retry_guide = _build_error_guide(msg["error"], st.session_state.dataset_info)
                 st.warning(f"다시 시도하려면:\n{retry_guide}")
-            if msg.get("recommendations"):
-                st.markdown("**💡 추천 질문:**")
-                for i, rec in enumerate(msg["recommendations"]):
-                    msg_idx = st.session_state.messages.index(msg)
-                    icons = ["📈", "🔍", "📊"]
-                    if st.button(f"{icons[i % 3]} {rec}", key=f"rec_{msg_idx}_{i}"):
-                        st.session_state.pending_prompt = rec
-                        st.rerun()
 
 st.markdown("---")
 
@@ -1977,7 +2193,7 @@ with prompt_col2:
 
 user_input = user_input_text if send_button and user_input_text else None
 
-# 추천 질문 클릭 시 자동 입력
+# 재실행 클릭 시 자동 입력
 if st.session_state.get("pending_prompt"):
     user_input = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
@@ -2092,6 +2308,7 @@ if prompt:
         dataset_info  = st.session_state.dataset_info
         datasets      = st.session_state.get("datasets", {})
         datasets_info = st.session_state.get("datasets_info", {})
+        _flow_exporter = st.session_state.flow_exporter
 
         code      = None
         fig       = None
@@ -2170,23 +2387,10 @@ if prompt:
             except Exception:
                 insight = None
 
-            # 추천 질문 생성
-            recommendations = []
-            try:
-                rec_prompt = PromptEngine.build_recommendation_prompt(prompt, dataset_info, datasets_info=datasets_info)
-                rec_raw = llm_client.generate(
-                    system_prompt="You suggest follow-up data analysis questions in Korean.",
-                    user_prompt=rec_prompt,
-                )
-                recommendations = [q.strip() for q in rec_raw.strip().split("\n") if q.strip()][:3]
-            except Exception:
-                recommendations = []
-
             assistant_msg["text"]    = "차트가 생성되었습니다."
             assistant_msg["fig"]     = fig
             assistant_msg["code"]    = code
             assistant_msg["insight"] = insight
-            assistant_msg["recommendations"] = recommendations
 
         st.session_state.messages.append(assistant_msg)
         
