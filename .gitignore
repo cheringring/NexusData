@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 .chat_history/
+copy.md
+.nexusdata_charts/

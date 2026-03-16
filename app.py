@@ -58,9 +58,9 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = "OPENAI_KEY_REMOVED"
-_ANTHROPIC_API_KEY = "여기에_Anthropic_API_KEY_입력"  # sk-ant-...
-_GROQ_API_KEY      = "GROQ_KEY_REMOVED"  
+_OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+_GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")  
 # ================================================================
 # HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
