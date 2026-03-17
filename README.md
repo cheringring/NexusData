@@ -56,7 +56,7 @@ NexusData Dashboard에 타일로 자동 추가합니다. 별도 대시보드 작
     ↓
 Streamlit UI (NexusData 웹앱)
     ↓
-PromptEngine (프롬프트 조립)
+PromptEngine (프롬프트 조립 + 데이터셋 컨텍스트 자동 구축)
     ↓
 LLM (OpenAI / Claude / Groq)
     ↓
@@ -65,6 +65,18 @@ CodeValidator (보안 검증 + 자동 수정)
 CodeExecutor (샌드박스 실행, 60초 타임아웃)
     ↓
 Plotly 차트 + 인사이트 + 추천 질문
+    ↓
+┌─────────────────────────────────────────────┐
+│         Dataiku DSS 자산 자동 게시           │
+│                                             │
+│  Managed Folder (nexusdata_charts)          │
+│  ├── {user_id}/  ← 차트 메타 JSON + HTML   │
+│  └── _history/   ← 세션별 대화 히스토리     │
+│                                             │
+│  dataiku.insights.save_data()               │
+│  → Static Insight 생성                      │
+│  → NexusData Dashboard 타일 자동 추가       │
+└─────────────────────────────────────────────┘
 ```
 
 ## 주요 기능
