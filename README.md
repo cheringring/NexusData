@@ -110,6 +110,8 @@ streamlit run app.py
 ![시작화면](image/시작화면.png)
 
 ### 분석 화면
+자연어 질문을 입력하면 LLM이 코드를 생성하고, 인터랙티브 Plotly 차트로 결과를 시각화합니다.
+
 ![분석화면](image/분석화면.png)
 
 ![분석화면2](image/2_분석화면.png)
@@ -118,9 +120,23 @@ streamlit run app.py
 
 ![분석화면4](image/분석화면4.png)
 
+### 코드 보기
+생성된 Python 코드를 확인하고, 맥락 기반 추천 질문으로 후속 분석을 이어갈 수 있습니다.
 
-### 코드 보기 + 추천 질문
-![코드,추천질문](image/코드,추천질문.png)
+![코드보기](image/코드보기%20.png)
+
+### 인사이트 축적
+분석할 때마다 Managed Folder(`nexusdata_charts`)에 차트 메타(JSON)와 HTML이 자동 저장됩니다.  
+vs-demo에서는 `dataikuapi`로 원격 업로드하며, 사용자별·데이터셋별로 분석 이력이 쌓입니다.
+
+![인사이트가쌓이는모습](image/인사이트가쌓이는모습.png)
+
+### 인사이트 기반 대시보드
+축적된 인사이트를 DSS 시나리오(`NEXUSDATA_PUBLISHINSIGHT`)가 트리거되면  
+`dataiku.insights.save_data()`로 Static Insight에 게시하고, NexusData Dashboard에 타일로 자동 추가합니다.  
+외부 앱에서 직접 호출할 수 없는 내부 API를 시나리오로 우회한 구조입니다.
+
+![인사이트기반대시보드](image/인사이트기반대시보드배포.png)
 
 ---
 
