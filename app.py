@@ -58,9 +58,16 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = "OPENAI_KEY_REMOVED"
-_ANTHROPIC_API_KEY = "여기에_Anthropic_API_KEY_입력"  # sk-ant-...
-_GROQ_API_KEY      = "GROQ_KEY_REMOVED"  
+_OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+_GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+
+# ================================================================
+# Dataiku 외부 연결 설정 (vs-demo - dataikuapi 방식)
+# ================================================================
+_DATAIKU_HOST    = "http://learndataiku.datasolution.kr:10000"
+_DATAIKU_API_KEY = "dkuaps-aPu9bA7uSsDtlB2TVuSgOOtc6k8WYolY"
+_DATAIKU_PROJECT = "STREAMLIT_TEST"
 # ================================================================
 # HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
@@ -69,29 +76,42 @@ class HistoryManager:
     """사용자별 채팅 히스토리를 Managed Folder(Dataiku) 또는 로컬 JSON으로 저장/복원"""
 
     FOLDER_NAME = "nexusdata_charts"
-    HISTORY_PREFIX = "_history"  # Managed Folder 내 경로: _history/{user_id}_{dataset}.json
+    HISTORY_PREFIX = "_history"
 
     def __init__(self, storage_dir: str = ".chat_history"):
         self.storage_dir = storage_dir
         self._in_dataiku = False
-        self._folder = None
+        self._project = None
+        self._folder_id = None
         try:
-            import dataiku
-            self._folder = dataiku.Folder(self.FOLDER_NAME)
-            self._in_dataiku = True
-        except Exception:
+            import dataikuapi
+            client = dataikuapi.DSSClient(_DATAIKU_HOST, _DATAIKU_API_KEY, no_check_certificate=True)
+            self._project = client.get_project(_DATAIKU_PROJECT)
+            for f in self._project.list_managed_folders():
+                if f["name"] == self.FOLDER_NAME:
+                    self._folder_id = f["id"]
+                    break
+            if self._folder_id:
+                self._in_dataiku = True
+        except Exception as e:
+            print(f"[HistoryManager] dataikuapi 연결 실패, 로컬 모드: {e}")
+        if not self._in_dataiku:
             os.makedirs(storage_dir, exist_ok=True)
 
     @staticmethod
     def get_user_id() -> str:
-        """Dataiku 사용자 ID 가져오기 (없으면 'default')"""
         try:
-            import dataiku
-            client = dataiku.api_client()
-            auth_info = client.get_auth_info()
-            return auth_info.get("authIdentifier", "default")
+            import dataikuapi
+            client = dataikuapi.DSSClient(_DATAIKU_HOST, _DATAIKU_API_KEY, no_check_certificate=True)
+            me = client.get_myself()
+            return me.login if hasattr(me, 'login') else "default"
         except Exception:
             return "default"
+
+    def _get_folder(self):
+        if self._project and self._folder_id:
+            return self._project.get_managed_folder(self._folder_id)
+        return None
 
     def _folder_path(self, user_id: str, dataset_name: str) -> str:
         safe_ds_name = re.sub(r'[^\w\-]', '_', dataset_name)
@@ -102,99 +122,94 @@ class HistoryManager:
         return os.path.join(self.storage_dir, f"{user_id}_{safe_ds_name}.json")
 
     def save_history(self, user_id: str, dataset_name: str, messages: List[dict], title: str = None) -> bool:
-        """히스토리 저장"""
         try:
             if title is None:
                 first_user_msg = next((m.get('content', '') for m in messages if m.get('role') == 'user'), '')
                 short_msg = first_user_msg[:20] + ('...' if len(first_user_msg) > 20 else '')
                 title = f"{short_msg}" if short_msg else dataset_name
             data = {
-                "user_id": user_id,
-                "dataset": dataset_name,
-                "title": title,
-                "last_updated": datetime.now().isoformat(),
-                "messages": messages
+                "user_id": user_id, "dataset": dataset_name, "title": title,
+                "last_updated": datetime.now().isoformat(), "messages": messages
             }
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-
-            if self._in_dataiku and self._folder:
-                self._folder.upload_stream(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
-            else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(payload.decode("utf-8"))
+            if self._in_dataiku:
+                folder = self._get_folder()
+                if folder:
+                    folder.upload_stream(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
+                    return True
+            filepath = self.get_history_file(user_id, dataset_name)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(payload.decode("utf-8"))
             return True
         except Exception as e:
             print(f"히스토리 저장 실패: {e}")
             return False
 
     def load_history(self, user_id: str, dataset_name: str) -> List[dict]:
-        """히스토리 복원"""
         try:
-            if self._in_dataiku and self._folder:
-                path = self._folder_path(user_id, dataset_name)
-                try:
-                    with self._folder.get_download_stream(path) as f:
-                        data = json.loads(f.read().decode("utf-8"))
-                    return data.get("messages", [])
-                except Exception:
-                    return []
-            else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                if not os.path.exists(filepath):
-                    return []
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                return data.get("messages", [])
+            if self._in_dataiku:
+                folder = self._get_folder()
+                if folder:
+                    try:
+                        with folder.get_download_stream(self._folder_path(user_id, dataset_name)) as f:
+                            return json.loads(f.read().decode("utf-8")).get("messages", [])
+                    except Exception:
+                        return []
+            filepath = self.get_history_file(user_id, dataset_name)
+            if not os.path.exists(filepath):
+                return []
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f).get("messages", [])
         except Exception as e:
             print(f"히스토리 로드 실패: {e}")
             return []
 
     def list_user_histories(self, user_id: str) -> List[dict]:
-        """사용자의 모든 히스토리 목록"""
         try:
             histories = []
-            if self._in_dataiku and self._folder:
-                prefix = f"{self.HISTORY_PREFIX}/{user_id}_"
-                for path in self._folder.list_paths_in_partition():
-                    if path.startswith(prefix) and path.endswith(".json"):
-                        try:
-                            with self._folder.get_download_stream(path) as f:
-                                data = json.loads(f.read().decode("utf-8"))
-                            histories.append({
-                                "dataset": data.get("dataset"),
-                                "title": data.get("title", data.get("dataset", "")),
-                                "last_updated": data.get("last_updated"),
-                                "message_count": len(data.get("messages", []))
-                            })
-                        except Exception:
-                            continue
-            else:
-                for filename in os.listdir(self.storage_dir):
-                    if filename.startswith(f"{user_id}_") and filename.endswith(".json"):
-                        filepath = os.path.join(self.storage_dir, filename)
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        histories.append({
-                            "dataset": data.get("dataset"),
-                            "title": data.get("title", data.get("dataset", "")),
-                            "last_updated": data.get("last_updated"),
-                            "message_count": len(data.get("messages", []))
-                        })
+            if self._in_dataiku:
+                folder = self._get_folder()
+                if folder:
+                    prefix = f"{self.HISTORY_PREFIX}/{user_id}_"
+                    for path in folder.list_paths_in_partition():
+                        if path.startswith(prefix) and path.endswith(".json"):
+                            try:
+                                with folder.get_download_stream(path) as f:
+                                    data = json.loads(f.read().decode("utf-8"))
+                                histories.append({
+                                    "dataset": data.get("dataset"),
+                                    "title": data.get("title", data.get("dataset", "")),
+                                    "last_updated": data.get("last_updated"),
+                                    "message_count": len(data.get("messages", []))
+                                })
+                            except Exception:
+                                continue
+                    return sorted(histories, key=lambda x: x.get("last_updated", ""), reverse=True)
+            for filename in os.listdir(self.storage_dir):
+                if filename.startswith(f"{user_id}_") and filename.endswith(".json"):
+                    filepath = os.path.join(self.storage_dir, filename)
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    histories.append({
+                        "dataset": data.get("dataset"),
+                        "title": data.get("title", data.get("dataset", "")),
+                        "last_updated": data.get("last_updated"),
+                        "message_count": len(data.get("messages", []))
+                    })
             return sorted(histories, key=lambda x: x.get("last_updated", ""), reverse=True)
         except Exception:
             return []
 
     def delete_history(self, user_id: str, dataset_name: str) -> bool:
-        """히스토리 삭제"""
         try:
-            if self._in_dataiku and self._folder:
-                path = self._folder_path(user_id, dataset_name)
-                self._folder.delete_path(path)
-            else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
+            if self._in_dataiku:
+                folder = self._get_folder()
+                if folder:
+                    folder.delete_path(self._folder_path(user_id, dataset_name))
+                    return True
+            filepath = self.get_history_file(user_id, dataset_name)
+            if os.path.exists(filepath):
+                os.remove(filepath)
             return True
         except Exception:
             return False
@@ -213,11 +228,14 @@ class DataikuManager:
 
     def _try_connect(self):
         try:
-            import dataiku
-            self._client = dataiku.api_client()
-            self._project = self._client.get_default_project()
+            import dataikuapi
+            self._client = dataikuapi.DSSClient(_DATAIKU_HOST, _DATAIKU_API_KEY, no_check_certificate=True)
+            self._project = self._client.get_project(_DATAIKU_PROJECT)
+            self._project.list_datasets()
             self._in_dataiku = True
-        except Exception:
+            print(f"[DataikuManager] dataikuapi 연결 성공: {_DATAIKU_HOST}")
+        except Exception as e:
+            print(f"[DataikuManager] dataikuapi 연결 실패, 데모 모드로 실행: {e}")
             self._in_dataiku = False
 
     @property
@@ -237,8 +255,7 @@ class DataikuManager:
         if not self._in_dataiku:
             return self._demo_dataframe(name)
         try:
-            import dataiku
-            dataset = dataiku.Dataset(name)
+            dataset = self._project.get_dataset(name)
             if limit > 0:
                 return dataset.get_dataframe(limit=limit)
             return dataset.get_dataframe()
@@ -249,9 +266,8 @@ class DataikuManager:
         if not self._in_dataiku:
             return []
         try:
-            import dataiku
-            dataset = dataiku.Dataset(name)
-            return dataset.read_schema()
+            dataset = self._project.get_dataset(name)
+            return dataset.get_schema().get("columns", [])
         except Exception:
             return []
 
@@ -397,18 +413,12 @@ class DataikuFlowExporter:
             self._ensure_assets_exist()
 
     def _ensure_assets_exist(self):
-        """Managed Folder + Dataset 자동 생성"""
         try:
-            import dataiku
-            client = dataiku.api_client()
-            project = client.get_default_project()
-
-            # ── Managed Folder 자동 생성 ──
-            existing_folders = [f["name"] for f in project.list_managed_folders()]
-            if self.MANAGED_FOLDER_NAME not in existing_folders:
+            project = self._dm._project
+            existing = [f["name"] for f in project.list_managed_folders()]
+            if self.MANAGED_FOLDER_NAME not in existing:
                 project.create_managed_folder(self.MANAGED_FOLDER_NAME)
                 print(f"[FlowExporter] Managed Folder '{self.MANAGED_FOLDER_NAME}' 생성 완료")
-
         except Exception as e:
             print(f"[FlowExporter] 자산 자동 생성 중 오류 (무시됨): {e}")
 
@@ -434,50 +444,64 @@ class DataikuFlowExporter:
 
         if self._in_dataiku:
             try:
-                import dataiku
-                import dataiku.insights
-                client = dataiku.api_client()
-                project = client.get_default_project()
+                project = self._dm._project
+                project_key = project.project_key
 
-                # ── 1) Static Insight 게시 ──
+                # ── 1) HTML 생성 ──
                 if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
-                    # Plotly figure → save_plotly (HTML 자동 변환)
-                    dataiku.insights.save_plotly(insight_id, fig, label=label)
+                    html_content = fig.to_html(include_plotlyjs="cdn", full_html=True)
                 elif hasattr(fig, 'savefig'):
-                    # Matplotlib figure → save_figure
-                    dataiku.insights.save_figure(insight_id, fig, label=label)
+                    import base64
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format="png", bbox_inches="tight")
+                    buf.seek(0)
+                    b64 = base64.b64encode(buf.read()).decode()
+                    html_content = f'<html><body><img src="data:image/png;base64,{b64}" style="max-width:100%;"/></body></html>'
                 else:
                     return False, "지원하지 않는 차트 타입"
 
-                # ── 2) Managed Folder에 메타 JSON 저장 ──
-                try:
-                    folder = dataiku.Folder(self.MANAGED_FOLDER_NAME)
+                # ── 2) Static Insight REST API로 게시 ──
+                import requests, base64
+                base_url = _DATAIKU_HOST.rstrip("/")
+                url = f"{base_url}/public/api/projects/{project_key}/insights/{insight_id}/data"
+                auth = base64.b64encode((_DATAIKU_API_KEY + ":").encode()).decode()
+                headers = {
+                    "Authorization": f"Basic {auth}",
+                    "Content-Type": "text/html; charset=utf-8",
+                    "X-Insight-Label": label,
+                    "X-Insight-Type": "static_file",
+                }
+                resp = requests.put(url, data=html_content.encode("utf-8"), headers=headers, timeout=30, verify=False)
+                if resp.status_code not in (200, 201, 204):
+                    return False, f"Insight 게시 실패 (HTTP {resp.status_code}): {resp.text[:200]}"
 
-                    meta = {
-                        "user_id": user_id,
-                        "timestamp": datetime.now().isoformat(),
-                        "dataset": dataset_name,
-                        "question": question,
-                        "code": code,
-                        "insight": insight,
-                        "chart_type": chart_type,
-                        "insight_id": insight_id,
-                        "label": label,
-                    }
-                    folder.upload_stream(
-                        f"{user_id}/{insight_id}.json",
-                        io.BytesIO(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
-                    )
+                # ── 3) Managed Folder에 메타 JSON 저장 ──
+                try:
+                    folder_id = None
+                    for f in project.list_managed_folders():
+                        if f["name"] == self.MANAGED_FOLDER_NAME:
+                            folder_id = f["id"]
+                            break
+                    if folder_id:
+                        folder = project.get_managed_folder(folder_id)
+                        meta = {
+                            "user_id": user_id, "timestamp": datetime.now().isoformat(),
+                            "dataset": dataset_name, "question": question, "code": code,
+                            "insight": insight, "chart_type": chart_type,
+                            "insight_id": insight_id, "label": label,
+                        }
+                        folder.upload_stream(
+                            f"{user_id}/{insight_id}.json",
+                            io.BytesIO(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+                        )
                 except Exception as e:
                     print(f"[FlowExporter] Managed Folder 저장 실패 (무시): {e}")
 
-                # ── 3) 대시보드에 Insight 타일 자동 추가 ──
+                # ── 4) 대시보드에 Insight 타일 자동 추가 ──
                 try:
                     self._add_insight_to_dashboard(project, insight_id, label)
                 except Exception as e:
                     print(f"[FlowExporter] 대시보드 타일 추가 실패: {type(e).__name__}: {e}")
-                    import traceback
-                    traceback.print_exc()
 
                 return True, f"대시보드 게시 완료 : {label}"
             except Exception as e:
@@ -496,8 +520,6 @@ class DataikuFlowExporter:
 
     def _add_insight_to_dashboard(self, project, insight_id: str, label: str):
         """NexusData 대시보드에 Insight 타일 자동 추가 (없으면 대시보드 생성)"""
-        import dataiku
-        client = dataiku.api_client()
         project_key = project.project_key
 
         # 대시보드 찾기
