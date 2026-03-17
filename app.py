@@ -2125,6 +2125,75 @@ if st.session_state.df is not None:
                 else:
                     st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
 
+    # ── EDA ──
+    with st.expander("EDA", expanded=False):
+        _loaded_ds = st.session_state.get("datasets", {})
+        _ds_names = list(_loaded_ds.keys()) if _loaded_ds else [st.session_state.selected_dataset or "default"]
+
+        if len(_ds_names) > 1:
+            _eda_ds_name = st.selectbox("데이터셋", _ds_names, key="eda_ds_select")
+        else:
+            _eda_ds_name = _ds_names[0]
+
+        _eda_df = _loaded_ds.get(_eda_ds_name, st.session_state.df)
+        _eda_info = st.session_state.datasets_info.get(_eda_ds_name, st.session_state.dataset_info)
+        _eda_numeric = _eda_info.get("numeric_columns", [])
+
+        eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs(["기술통계", "분포", "상관관계", "이상치"])
+
+        with eda_tab1:
+            st.dataframe(_eda_df[_eda_numeric].describe().T if _eda_numeric else pd.DataFrame(), use_container_width=True)
+            cat_cols = _eda_df.select_dtypes(include="object").columns.tolist()
+            if cat_cols:
+                st.caption(f"범주형 컬럼: {', '.join(cat_cols)}")
+                for cc in cat_cols[:5]:
+                    vc = _eda_df[cc].value_counts().head(10)
+                    st.caption(f"`{cc}` 상위 {len(vc)}개: {', '.join(f'{k}({v})' for k, v in vc.items())}")
+
+        with eda_tab2:
+            if _eda_numeric and _PLOTLY_AVAILABLE:
+                _dist_col = st.selectbox("컬럼 선택", _eda_numeric, key=f"eda_dist_{_eda_ds_name}")
+                if _dist_col:
+                    _dist_data = _eda_df[[_dist_col]].dropna()
+                    if len(_dist_data) > 10000:
+                        _dist_data = _dist_data.sample(10000, random_state=42)
+                    _fig_dist = px.histogram(_dist_data, x=_dist_col, marginal="box", title=f"{_dist_col} 분포")
+                    _fig_dist.update_layout(height=400)
+                    st.plotly_chart(_fig_dist, use_container_width=True)
+            else:
+                st.info("수치형 컬럼이 없거나 Plotly가 설치되지 않았습니다.")
+
+        with eda_tab3:
+            if len(_eda_numeric) >= 2 and _PLOTLY_AVAILABLE:
+                _corr_matrix = _eda_df[_eda_numeric].corr(numeric_only=True)
+                _fig_corr = px.imshow(
+                    _corr_matrix.round(2), text_auto=True, color_continuous_scale="RdBu_r",
+                    zmin=-1, zmax=1, title="상관관계 히트맵", aspect="auto",
+                )
+                _fig_corr.update_layout(height=max(400, len(_eda_numeric) * 40))
+                st.plotly_chart(_fig_corr, use_container_width=True)
+                _stat_tests = _eda_info.get("stat_tests", {})
+                if _stat_tests:
+                    st.caption("Pearson 상관관계 (|r| > 0.3)")
+                    for pair, vals in _stat_tests.items():
+                        sig = "✅" if vals["significant"] else "❌"
+                        st.caption(f"`{pair}`: r={vals['r']}, p={vals['p']} {sig}")
+            else:
+                st.info("수치형 컬럼이 2개 이상 필요합니다.")
+
+        with eda_tab4:
+            _outlier_detail = _eda_info.get("outlier_detail", {})
+            if _outlier_detail and _PLOTLY_AVAILABLE:
+                _box_cols = list(_outlier_detail.keys())[:8]
+                _fig_box = px.box(_eda_df, y=_box_cols, title="이상치 분포 (IQR 기준)")
+                _fig_box.update_layout(height=400)
+                st.plotly_chart(_fig_box, use_container_width=True)
+                for col, cnt in _outlier_detail.items():
+                    pct = round(cnt / len(_eda_df) * 100, 2)
+                    st.caption(f"`{col}`: {cnt:,}건 ({pct}%)")
+            else:
+                st.info("IQR 기준 이상치가 감지되지 않았습니다.")
+
     st.markdown("---")
 
 # ── 2) 대화 내용 표시 ──
