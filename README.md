@@ -1,10 +1,71 @@
 # 📊 NexusData
 
-> **⚠️ 현재 Demo 버전입니다.**  
-> Dataiku 내 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
+> **⚠️ 현재 Demo 버전입니다. (`vs-demo` 브랜치)**  
+> Dataiku 내부 웹앱이 아닌 **외부 Streamlit 앱**으로 동작하며, `dataikuapi`를 통해 DSS에 원격 연결합니다.
 
 Dataiku DSS 웹앱(Streamlit) 기반의 대화형 데이터 분석 도구.  
 사용자의 자연어 질의를 LLM이 해석하여 Python 분석 코드를 자동 생성·실행하고, Plotly 인터랙티브 차트와 통계 인사이트를 제공합니다.
+
+---
+
+## main vs vs-demo 브랜치 차이
+
+| 항목 | `main` (운영) | `vs-demo` (데모) |
+|------|--------------|-----------------|
+| 실행 환경 | Dataiku DSS 내부 웹앱 | 외부 Streamlit 앱 |
+| DSS 연결 방식 | `dataiku` 내장 모듈 | `dataikuapi` 원격 API |
+| 데이터 로드 | `dataiku.Dataset()` 직접 접근 | `dataikuapi` 클라이언트로 원격 로드 |
+| Insight 게시 | `dataiku.insights.save_data()` 직접 호출 | **DSS 시나리오 트리거 방식으로 우회** |
+| 차트/히스토리 저장 | Managed Folder 직접 쓰기 | `dataikuapi`로 원격 업로드 후 시나리오 실행 |
+| DSS 없이 실행 | 불가 | 가능 (로컬 데모 모드) |
+
+### Insight 게시 우회 방식 (vs-demo 핵심)
+
+Dataiku Public API에는 Static Insight payload를 직접 업로드하는 엔드포인트가 없어서,  
+아래 흐름으로 우회 구현했습니다:
+
+```
+외부 앱 (vs-demo)
+    │
+    ├─ 1. 차트 HTML + 메타 JSON 생성
+    │
+    ├─ 2. Managed Folder "nexusdata_charts" 에 업로드
+    │       {user_id}/nexusdata_{user_id}_{timestamp}.json
+    │       {user_id}/nexusdata_{user_id}_{timestamp}.html
+    │
+    └─ 3. DSS 시나리오 "NEXUSDATA_PUBLISHINSIGHT" 트리거
+                │
+                └─ (DSS 내부) dss_scenario_step.py 실행
+                        ├─ Managed Folder에서 미게시 HTML 탐색
+                        ├─ dataiku.insights.save_data() 호출
+                        ├─ NexusData Dashboard 타일 자동 추가
+                        └─ JSON에 "published": true 마킹
+```
+
+> `dss_scenario_step.py` 코드를 DSS 프로젝트의 시나리오 Python 스텝으로 등록해야 합니다.  
+> 시나리오 ID: `NEXUSDATA_PUBLISHINSIGHT` / 프로젝트: `STREAMRIT_TEST_1`
+
+### Managed Folder 구조
+
+```
+nexusdata_charts/
+├── _history/
+│   └── {user_id}_{dataset}.json     # 대화 히스토리
+└── {user_id}/
+    └── nexusdata_{user_id}_{ts}.json  # 차트 메타
+    └── nexusdata_{user_id}_{ts}.html  # 차트 HTML
+```
+
+히스토리 JSON 구조 (`_history/{user_id}_{dataset}.json`):
+```json
+{
+  "user_id": "kwonc8814",
+  "dataset": "EL_Sensor",
+  "title": "EL_Sensor | x1과 x2 관계를 산점도로 표현",
+  "last_updated": "2026-03-17T10:00:00.000000",
+  "messages": [...]
+}
+```
 
 ---
 
