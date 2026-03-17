@@ -439,6 +439,31 @@ class DataikuFlowExporter:
                 client = dataiku.api_client()
                 project = client.get_default_project()
 
+                # ── 차트 레이아웃 최적화 (대시보드 타일용) ──
+                try:
+                    if _PLOTLY_AVAILABLE and hasattr(fig, 'update_layout'):
+                        # 차트 종류별 높이 동적 조절
+                        chart_h = 400
+                        if hasattr(fig, 'data') and fig.data:
+                            trace_type = type(fig.data[0]).__name__.lower()
+                            if 'heatmap' in trace_type:
+                                n_vars = len(fig.data[0].z) if hasattr(fig.data[0], 'z') and fig.data[0].z is not None else 8
+                                chart_h = max(400, n_vars * 60 + 100)
+                        fig.update_layout(
+                            height=chart_h,
+                            margin=dict(t=60, b=80, l=80, r=30),
+                            title=dict(font=dict(size=14)),
+                        )
+                        # 서브플롯 제목 겹침 방지
+                        if hasattr(fig.layout, 'annotations'):
+                            for ann in fig.layout.annotations:
+                                if hasattr(ann, 'text') and ann.text and len(ann.text) > 20:
+                                    ann.text = ann.text[:20] + '...'
+                                if hasattr(ann, 'font'):
+                                    ann.font.size = 10
+                except Exception:
+                    pass
+
                 # ── 1) Static Insight 게시 ──
                 if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
                     # Plotly figure → save_plotly (HTML 자동 변환)
@@ -554,7 +579,7 @@ class DataikuFlowExporter:
                 "left": 0,
                 "top": max_row,
                 "width": 12,
-                "height": 10,
+                "height": 15,
             },
             "tileParams": {},
             "clickAction": "DO_NOTHING",
