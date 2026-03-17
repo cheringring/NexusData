@@ -11,3 +11,4 @@ koreanize-matplotlib>=0.1.1
 scipy>=1.11.0
 statsmodels>=0.14.0
 python-dotenv>=1.0.0
+dataiku-api-client>=14.0.0

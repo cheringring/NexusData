@@ -1,10 +1,45 @@
 # 📊 NexusData
 
 > **⚠️ 현재 Demo 버전입니다.**  
-> Dataiku 내 EL_Sensor, EL_Vibration 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
+> Dataiku 내 데이터셋 기반으로 동작하며, 실제 운영 환경 배포 전 기능 검증 단계입니다.
 
 Dataiku DSS 웹앱(Streamlit) 기반의 대화형 데이터 분석 도구.  
 사용자의 자연어 질의를 LLM이 해석하여 Python 분석 코드를 자동 생성·실행하고, Plotly 인터랙티브 차트와 통계 인사이트를 제공합니다.
+
+---
+
+## 빠른 시작 (Demo)
+
+```bash
+# 1) 저장소 클론
+git clone git@gitlab.datasolution.kr:kwoncheeun/nexusdata.git
+cd nexusdata
+git checkout vs-demo
+
+# 2) 가상환경 생성 및 활성화
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
+
+# 3) 패키지 설치
+pip install -r requirements.txt
+
+# 4) 환경변수 설정 — .env 파일 생성
+# .env 파일에 아래 내용 입력:
+# OPENAI_API_KEY=sk-...
+# GROQ_API_KEY=gsk_...
+
+# 5) 실행
+streamlit run app.py
+```
+
+> 반드시 가상환경(`.venv`)을 활성화한 상태에서 실행하세요.  
+> 시스템 Python으로 실행하면 `koreanize-matplotlib`, `dataikuapi` 등 패키지를 찾지 못합니다.
+>
+> Dataiku DSS 연결 없이도 로컬 데모 모드로 실행 가능합니다.  
+> DSS 연결 시 `nexusdata_charts` Managed Folder에 차트/히스토리가 자동 저장됩니다.
 
 ---
 

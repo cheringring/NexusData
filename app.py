@@ -25,6 +25,13 @@ import matplotlib
 matplotlib.use("Agg")  # pyplot import 전에 반드시 설정
 import matplotlib.pyplot as plt
 
+# .env 로드
+try:
+    from dotenv import load_dotenv
+    load_dotenv(encoding="utf-8")
+except ImportError:
+    pass
+
 # 한글 폰트 자동 설정 (koreanize-matplotlib 사용)
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -33,7 +40,6 @@ try:
     _KOREAN_FONT_OK = True
 except ImportError:
     _KOREAN_FONT_OK = False
-    print("Warning: koreanize-matplotlib not installed. Korean text may not display correctly.")
 
 # plotly 선택적 import
 try:
@@ -58,16 +64,16 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-_GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "")
+_OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "여기에_OpenAI_API_KEY_입력")
+_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "여기에_Anthropic_API_KEY_입력")
+_GROQ_API_KEY      = os.getenv("GROQ_API_KEY", "여기에_Groq_API_KEY_입력")
 
 # ================================================================
 # Dataiku 외부 연결 설정 (vs-demo - dataikuapi 방식)
 # ================================================================
 _DATAIKU_HOST    = "http://learndataiku.datasolution.kr:10000"
 _DATAIKU_API_KEY = "dkuaps-aPu9bA7uSsDtlB2TVuSgOOtc6k8WYolY"
-_DATAIKU_PROJECT = "STREAMLIT_TEST"
+_DATAIKU_PROJECT = "STREAMRIT_TEST_1"
 # ================================================================
 # HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
@@ -135,7 +141,7 @@ class HistoryManager:
             if self._in_dataiku:
                 folder = self._get_folder()
                 if folder:
-                    folder.upload_stream(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
+                    folder.put_file(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
                     return True
             filepath = self.get_history_file(user_id, dataset_name)
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -151,8 +157,8 @@ class HistoryManager:
                 folder = self._get_folder()
                 if folder:
                     try:
-                        with folder.get_download_stream(self._folder_path(user_id, dataset_name)) as f:
-                            return json.loads(f.read().decode("utf-8")).get("messages", [])
+                        data = json.loads(folder.get_file(self._folder_path(user_id, dataset_name)).read().decode("utf-8"))
+                        return data.get("messages", [])
                     except Exception:
                         return []
             filepath = self.get_history_file(user_id, dataset_name)
@@ -171,11 +177,11 @@ class HistoryManager:
                 folder = self._get_folder()
                 if folder:
                     prefix = f"{self.HISTORY_PREFIX}/{user_id}_"
-                    for path in folder.list_paths_in_partition():
+                    for item in folder.list_contents().get("items", []):
+                        path = item.get("path", "")
                         if path.startswith(prefix) and path.endswith(".json"):
                             try:
-                                with folder.get_download_stream(path) as f:
-                                    data = json.loads(f.read().decode("utf-8"))
+                                data = json.loads(folder.get_file(path).read().decode("utf-8"))
                                 histories.append({
                                     "dataset": data.get("dataset"),
                                     "title": data.get("title", data.get("dataset", "")),
@@ -205,7 +211,7 @@ class HistoryManager:
             if self._in_dataiku:
                 folder = self._get_folder()
                 if folder:
-                    folder.delete_path(self._folder_path(user_id, dataset_name))
+                    folder.delete_file(self._folder_path(user_id, dataset_name))
                     return True
             filepath = self.get_history_file(user_id, dataset_name)
             if os.path.exists(filepath):
@@ -256,9 +262,16 @@ class DataikuManager:
             return self._demo_dataframe(name)
         try:
             dataset = self._project.get_dataset(name)
-            if limit > 0:
-                return dataset.get_dataframe(limit=limit)
-            return dataset.get_dataframe()
+            columns = [c["name"] for c in dataset.get_schema().get("columns", [])]
+            rows = []
+            for i, row in enumerate(dataset.iter_rows()):
+                rows.append(row)
+                if limit > 0 and i + 1 >= limit:
+                    break
+            df = pd.DataFrame(rows, columns=columns if columns else None)
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='ignore')
+            return df
         except Exception as e:
             raise RuntimeError(f"데이터셋 '{name}' 로드 실패: {str(e)}")
 
@@ -425,11 +438,11 @@ class DataikuFlowExporter:
     def publish_chart(self, user_id: str, fig, code: str, question: str,
                       insight: str = "", dataset_name: str = "",
                       chart_type: str = "plotly") -> Tuple[bool, str]:
-        """LLM 생성 차트를 Dataiku Static Insight로 게시 → 대시보드에서 바로 확인 가능"""
+        """차트를 Managed Folder(Dataiku) 또는 로컬에 저장 후 시나리오로 insight 게시"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         insight_id = f"nexusdata_{user_id}_{ts}"
 
-        # 차트 제목 추출 (fig.layout.title)
+        # 차트 제목 추출
         chart_title = ""
         try:
             if hasattr(fig, 'layout') and hasattr(fig.layout, 'title'):
@@ -440,83 +453,84 @@ class DataikuFlowExporter:
                     chart_title = t.text
         except Exception:
             pass
-        label = f"NexusData: {chart_title}" if chart_title else f"NexusData: {question[:50]}"
+        label = chart_title if chart_title else question[:50]
+
+        # ── HTML 생성 ──
+        html_content = None
+        if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
+            html_content = fig.to_html(include_plotlyjs="cdn", full_html=True)
+        elif hasattr(fig, 'savefig'):
+            import base64 as _b64
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+            b64 = _b64.b64encode(buf.read()).decode()
+            html_content = (
+                '<html><body>'
+                f'<img src="data:image/png;base64,{b64}" style="max-width:100%;"/>'
+                '</body></html>'
+            )
+        if html_content is None:
+            return False, "지원하지 않는 차트 타입"
+
+        # ── 메타 JSON ──
+        meta = {
+            "user_id": user_id,
+            "dataset": dataset_name,
+            "title": label,
+            "last_updated": datetime.now().isoformat(),
+            "question": question,
+            "code": code,
+            "insight": insight,
+            "chart_type": chart_type,
+            "insight_id": insight_id,
+        }
 
         if self._in_dataiku:
             try:
                 project = self._dm._project
-                project_key = project.project_key
+                # Managed Folder에 JSON + HTML 저장
+                folder_id = None
+                for f in project.list_managed_folders():
+                    if f["name"] == self.MANAGED_FOLDER_NAME:
+                        folder_id = f["id"]
+                        break
+                if not folder_id:
+                    return False, "Managed Folder를 찾을 수 없습니다"
 
-                # ── 1) HTML 생성 ──
-                if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
-                    html_content = fig.to_html(include_plotlyjs="cdn", full_html=True)
-                elif hasattr(fig, 'savefig'):
-                    import base64
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format="png", bbox_inches="tight")
-                    buf.seek(0)
-                    b64 = base64.b64encode(buf.read()).decode()
-                    html_content = f'<html><body><img src="data:image/png;base64,{b64}" style="max-width:100%;"/></body></html>'
-                else:
-                    return False, "지원하지 않는 차트 타입"
+                folder = project.get_managed_folder(folder_id)
+                base_path = f"{user_id}/{insight_id}"
+                folder.put_file(
+                    f"{base_path}.json",
+                    io.BytesIO(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+                )
+                folder.put_file(
+                    f"{base_path}.html",
+                    io.BytesIO(html_content.encode("utf-8"))
+                )
 
-                # ── 2) Static Insight REST API로 게시 ──
-                import requests, base64
-                base_url = _DATAIKU_HOST.rstrip("/")
-                url = f"{base_url}/public/api/projects/{project_key}/insights/{insight_id}/data"
-                auth = base64.b64encode((_DATAIKU_API_KEY + ":").encode()).decode()
-                headers = {
-                    "Authorization": f"Basic {auth}",
-                    "Content-Type": "text/html; charset=utf-8",
-                    "X-Insight-Label": label,
-                    "X-Insight-Type": "static_file",
-                }
-                resp = requests.put(url, data=html_content.encode("utf-8"), headers=headers, timeout=30, verify=False)
-                if resp.status_code not in (200, 201, 204):
-                    return False, f"Insight 게시 실패 (HTTP {resp.status_code}): {resp.text[:200]}"
-
-                # ── 3) Managed Folder에 메타 JSON 저장 ──
+                # 시나리오 트리거 (DSS 내부에서 insight 게시)
                 try:
-                    folder_id = None
-                    for f in project.list_managed_folders():
-                        if f["name"] == self.MANAGED_FOLDER_NAME:
-                            folder_id = f["id"]
-                            break
-                    if folder_id:
-                        folder = project.get_managed_folder(folder_id)
-                        meta = {
-                            "user_id": user_id, "timestamp": datetime.now().isoformat(),
-                            "dataset": dataset_name, "question": question, "code": code,
-                            "insight": insight, "chart_type": chart_type,
-                            "insight_id": insight_id, "label": label,
-                        }
-                        folder.upload_stream(
-                            f"{user_id}/{insight_id}.json",
-                            io.BytesIO(json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
-                        )
+                    scenario = project.get_scenario("NEXUSDATA_PUBLISHINSIGHT")
+                    trigger_fire = scenario.run()
+                    print(f"[FlowExporter] 시나리오 트리거 완료")
                 except Exception as e:
-                    print(f"[FlowExporter] Managed Folder 저장 실패 (무시): {e}")
+                    print(f"[FlowExporter] 시나리오 트리거 실패 (무시): {e}")
 
-                # ── 4) 대시보드에 Insight 타일 자동 추가 ──
-                try:
-                    self._add_insight_to_dashboard(project, insight_id, label)
-                except Exception as e:
-                    print(f"[FlowExporter] 대시보드 타일 추가 실패: {type(e).__name__}: {e}")
-
-                return True, f"대시보드 게시 완료 : {label}"
+                return True, f"게시 완료: {label}"
             except Exception as e:
-                return False, f"대시보드 게시 실패: {str(e)}"
+                return False, f"게시 실패: {str(e)}"
         else:
-            # 로컬 폴백
+            # 로컬 저장 (동일 구조)
             local_dir = os.path.join(".nexusdata_charts", user_id)
             os.makedirs(local_dir, exist_ok=True)
-            local_path = os.path.join(local_dir, f"{insight_id}.html")
-            if _PLOTLY_AVAILABLE and hasattr(fig, 'to_html'):
-                with open(local_path, "w", encoding="utf-8") as f:
-                    f.write(fig.to_html(include_plotlyjs="cdn", full_html=True))
-            return True, f"로컬 저장 완료: {local_path}"
+            base_path = os.path.join(local_dir, insight_id)
+            with open(f"{base_path}.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            with open(f"{base_path}.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            return True, f"로컬 저장 완료: {label}"
 
-    DASHBOARD_NAME = "NexusData Dashboard"
 
     def _add_insight_to_dashboard(self, project, insight_id: str, label: str):
         """NexusData 대시보드에 Insight 타일 자동 추가 (없으면 대시보드 생성)"""
@@ -2064,7 +2078,7 @@ if st.session_state.df is not None:
         tabs = st.tabs(list(loaded_datasets.keys()))
         for tab, (ds_name, ds_df) in zip(tabs, loaded_datasets.items()):
             with tab:
-                st.dataframe(ds_df.head(10), use_container_width=True, height=200)
+                st.dataframe(ds_df.head(10), width="stretch", height=200)
                 ds_info = st.session_state.datasets_info.get(ds_name, {})
                 if ds_info:
                     st.caption(
@@ -2103,7 +2117,7 @@ if st.session_state.df is not None:
         st.markdown("### 데이터 미리보기")
         st.dataframe(
             st.session_state.df.head(10),
-            use_container_width=True,
+            width="stretch",
             height=250,
         )
     
@@ -2160,9 +2174,9 @@ for msg in st.session_state.messages:
             if msg.get("fig") is not None:
                 fig = msg["fig"]
                 if CodeExecutor.is_plotly_figure(fig):
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width="stretch")
                 elif CodeExecutor.is_matplotlib_figure(fig):
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig, width="stretch")
             if msg.get("insight"):
                 st.info(f"**인사이트**: {msg['insight']}")
             # 코드 보기 (전체 너비)
@@ -2230,6 +2244,7 @@ with col1:
         llm_provider = st.selectbox(
             "Provider",
             options=["openai", "groq", "claude"],
+            index=0,
             format_func=lambda x: "Groq" if x == "groq" else ("OpenAI" if x == "openai" else "Claude"),
             label_visibility="collapsed"
         )
@@ -2242,6 +2257,7 @@ with col1:
         selected_model = st.selectbox(
             "Model",
             options=model_options[llm_provider],
+            index=0,
             label_visibility="collapsed"
         )
     
@@ -2256,6 +2272,8 @@ with col1:
                 st.session_state["_client_key"] = _client_key
             except Exception as e:
                 st.error(f"LLM 연결 실패: {str(e)}")
+    else:
+        st.warning("LLM을 선택해주세요.")
 
 with col2:
     st.markdown("**데이터셋 선택**")
