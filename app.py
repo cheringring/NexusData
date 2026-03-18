@@ -430,7 +430,12 @@ class DataikuFlowExporter:
                     chart_title = t.text
         except Exception:
             pass
-        label = f"NexusData: {chart_title}" if chart_title else f"NexusData: {question[:50]}"
+        # 라벨: 데이터셋명 + 차트 제목 (또는 질문 요약)
+        _ds_tag = f"[{dataset_name}] " if dataset_name else ""
+        if chart_title:
+            label = f"{_ds_tag}{chart_title}"
+        else:
+            label = f"{_ds_tag}{question[:60]}" if question else f"{_ds_tag}분석 결과"
 
         if self._in_dataiku:
             try:
@@ -504,7 +509,7 @@ class DataikuFlowExporter:
                     import traceback
                     traceback.print_exc()
 
-                return True, f"대시보드 게시 완료 : {label}"
+                return True, f"✅ 게시 완료: {label}"
             except Exception as e:
                 return False, f"대시보드 게시 실패: {str(e)}"
         else:
@@ -2103,7 +2108,7 @@ if st.session_state.df is not None:
                                 st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
 
                         # 멀티 데이터셋 품질 리포트 게시 버튼
-                        if _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+                        if _PLOTLY_AVAILABLE:
                             if st.button("📤 품질 리포트 게시", key=f"pub_quality_{ds_name}"):
                                 _qr_labels = ["결측치", "이상치 (IQR)", "중복 행"]
                                 _qr_values = [total_missing, total_outliers, dup_count]
@@ -2121,7 +2126,10 @@ if st.session_state.df is not None:
                                     user_id=st.session_state.user_id, fig=_fig_qr, code="",
                                     question=f"{ds_name} 품질 리포트", dataset_name=ds_name,
                                 )
-                                st.success(msg) if ok else st.error(msg)
+                                if ok:
+                                    st.success(msg)
+                                else:
+                                    st.error(msg)
     else:
         # 단일 데이터셋
         st.markdown("### 데이터 미리보기")
@@ -2172,7 +2180,7 @@ if st.session_state.df is not None:
                     st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
 
             # 품질 리포트 대시보드 게시 버튼
-            if _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+            if _PLOTLY_AVAILABLE:
                 if st.button("📤 품질 리포트 게시", key="pub_quality"):
                     _qr_labels = ["결측치", "이상치 (IQR)", "중복 행"]
                     _qr_values = [total_missing, total_outliers, dup_count]
@@ -2191,7 +2199,10 @@ if st.session_state.df is not None:
                         user_id=st.session_state.user_id, fig=_fig_qr, code="",
                         question=f"{_ds_label} 품질 리포트", dataset_name=_ds_label,
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
     # ── EDA ──
     with st.expander("EDA", expanded=False):
@@ -2218,7 +2229,7 @@ if st.session_state.df is not None:
                 for cc in cat_cols[:5]:
                     vc = _eda_df[cc].value_counts().head(10)
                     st.caption(f"`{cc}` 상위 {len(vc)}개: {', '.join(f'{k}({v})' for k, v in vc.items())}")
-            if _eda_numeric and _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+            if _eda_numeric and _PLOTLY_AVAILABLE:
                 if st.button("📤 기술통계 게시", key=f"pub_desc_{_eda_ds_name}"):
                     # describe를 Plotly 테이블로 변환
                     _desc_reset = _desc_df.reset_index().rename(columns={"index": "변수"})
@@ -2233,7 +2244,10 @@ if st.session_state.df is not None:
                         user_id=st.session_state.user_id, fig=_fig_desc, code="",
                         question=f"{_eda_ds_name} 기술통계", dataset_name=_eda_ds_name,
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
         with eda_tab2:
             if _eda_numeric and _PLOTLY_AVAILABLE:
@@ -2245,13 +2259,16 @@ if st.session_state.df is not None:
                     _fig_dist = px.histogram(_dist_data, x=_dist_col, marginal="box", title=f"{_dist_col} 분포")
                     _fig_dist.update_layout(height=400)
                     st.plotly_chart(_fig_dist, use_container_width=True)
-                    if st.session_state.get("flow_exporter") and st.button("📤 분포 차트 게시", key=f"pub_dist_{_eda_ds_name}"):
+                    if st.button("📤 분포 차트 게시", key=f"pub_dist_{_eda_ds_name}"):
                         _exp = st.session_state.flow_exporter
                         ok, msg = _exp.publish_chart(
                             user_id=st.session_state.user_id, fig=_fig_dist, code="",
-                            question=f"{_dist_col} 분포", dataset_name=_eda_ds_name,
+                            question=f"[{_eda_ds_name}] {_dist_col} 분포", dataset_name=_eda_ds_name,
                         )
-                        st.success(msg) if ok else st.error(msg)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
             else:
                 st.info("수치형 컬럼이 없거나 Plotly가 설치되지 않았습니다.")
 
@@ -2270,13 +2287,16 @@ if st.session_state.df is not None:
                     for pair, vals in _stat_tests.items():
                         sig = "✅" if vals["significant"] else "❌"
                         st.caption(f"`{pair}`: r={vals['r']}, p={vals['p']} {sig}")
-                if st.session_state.get("flow_exporter") and st.button("📤 상관관계 히트맵 게시", key=f"pub_corr_{_eda_ds_name}"):
+                if st.button("📤 상관관계 히트맵 게시", key=f"pub_corr_{_eda_ds_name}"):
                     _exp = st.session_state.flow_exporter
                     ok, msg = _exp.publish_chart(
                         user_id=st.session_state.user_id, fig=_fig_corr, code="",
-                        question="상관관계 히트맵", dataset_name=_eda_ds_name,
+                        question=f"[{_eda_ds_name}] 상관관계 히트맵 ({len(_eda_numeric)}개 변수)", dataset_name=_eda_ds_name,
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
             else:
                 st.info("수치형 컬럼이 2개 이상 필요합니다.")
 
@@ -2290,13 +2310,16 @@ if st.session_state.df is not None:
                 for col, cnt in _outlier_detail.items():
                     pct = round(cnt / len(_eda_df) * 100, 2)
                     st.caption(f"`{col}`: {cnt:,}건 ({pct}%)")
-                if st.session_state.get("flow_exporter") and st.button("📤 이상치 차트 게시", key=f"pub_outlier_{_eda_ds_name}"):
+                if st.button("📤 이상치 차트 게시", key=f"pub_outlier_{_eda_ds_name}"):
                     _exp = st.session_state.flow_exporter
                     ok, msg = _exp.publish_chart(
                         user_id=st.session_state.user_id, fig=_fig_box, code="",
-                        question="이상치 분포 (IQR)", dataset_name=_eda_ds_name,
+                        question=f"[{_eda_ds_name}] 이상치 분포 (IQR) - {', '.join(_box_cols)}", dataset_name=_eda_ds_name,
                     )
-                    st.success(msg) if ok else st.error(msg)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
             else:
                 st.info("IQR 기준 이상치가 감지되지 않았습니다.")
 
@@ -2328,21 +2351,20 @@ for msg in st.session_state.messages:
                     st.code(msg["code"], language="python")
             # Flow 연동 버튼: 대시보드 게시 (JSON 메타 + Insight + 대시보드 타일)
             if _has_fig:
-                if st.session_state.get("flow_exporter"):
-                    if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
-                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
-                        _ds_name = st.session_state.selected_dataset or ''
-                        _exporter = st.session_state.flow_exporter
-                        _uid = st.session_state.user_id
-                        ok_chart, chart_msg = _exporter.publish_chart(
-                            user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
-                            question=_user_q, insight=msg.get("insight", ""),
-                            dataset_name=_ds_name,
-                        )
-                        if ok_chart:
-                            st.success(chart_msg)
-                        else:
-                            st.error(chart_msg)
+                if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
+                    _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                    _ds_name = st.session_state.selected_dataset or ''
+                    _exporter = st.session_state.flow_exporter
+                    _uid = st.session_state.user_id
+                    ok_chart, chart_msg = _exporter.publish_chart(
+                        user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
+                        question=_user_q, insight=msg.get("insight", ""),
+                        dataset_name=_ds_name,
+                    )
+                    if ok_chart:
+                        st.success(chart_msg)
+                    else:
+                        st.error(chart_msg)
             if msg.get("error"):
                 st.error(msg["error"])
                 retry_guide = _build_error_guide(msg["error"], st.session_state.dataset_info)
