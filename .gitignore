@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .chat_history/
+.venv/
+.nexusdata_charts/
+copy.md

@@ -2101,6 +2101,27 @@ if st.session_state.df is not None:
                                 st.metric("중복 행", "0건", delta="양호", delta_color="normal")
                             else:
                                 st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
+
+                        # 멀티 데이터셋 품질 리포트 게시 버튼
+                        if _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+                            if st.button("📤 품질 리포트 게시", key=f"pub_quality_{ds_name}"):
+                                _qr_labels = ["결측치", "이상치 (IQR)", "중복 행"]
+                                _qr_values = [total_missing, total_outliers, dup_count]
+                                _qr_colors = ['#FF6B6B' if v > 0 else '#51CF66' for v in _qr_values]
+                                _fig_qr = go.Figure(data=[go.Bar(
+                                    x=_qr_labels, y=_qr_values,
+                                    marker_color=_qr_colors, text=_qr_values, textposition='auto',
+                                )])
+                                _fig_qr.update_layout(
+                                    title=f"{ds_name} 데이터 품질 리포트",
+                                    yaxis_title="건수", height=350,
+                                )
+                                _exp = st.session_state.flow_exporter
+                                ok, msg = _exp.publish_chart(
+                                    user_id=st.session_state.user_id, fig=_fig_qr, code="",
+                                    question=f"{ds_name} 품질 리포트", dataset_name=ds_name,
+                                )
+                                st.success(msg) if ok else st.error(msg)
     else:
         # 단일 데이터셋
         st.markdown("### 데이터 미리보기")
@@ -2150,6 +2171,28 @@ if st.session_state.df is not None:
                 else:
                     st.metric("중복 행", f"{dup_count:,}건", delta=f"{dup_pct}%", delta_color="inverse")
 
+            # 품질 리포트 대시보드 게시 버튼
+            if _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+                if st.button("📤 품질 리포트 게시", key="pub_quality"):
+                    _qr_labels = ["결측치", "이상치 (IQR)", "중복 행"]
+                    _qr_values = [total_missing, total_outliers, dup_count]
+                    _qr_colors = ['#FF6B6B' if v > 0 else '#51CF66' for v in _qr_values]
+                    _fig_qr = go.Figure(data=[go.Bar(
+                        x=_qr_labels, y=_qr_values,
+                        marker_color=_qr_colors, text=_qr_values, textposition='auto',
+                    )])
+                    _ds_label = st.session_state.selected_dataset or "dataset"
+                    _fig_qr.update_layout(
+                        title=f"{_ds_label} 데이터 품질 리포트",
+                        yaxis_title="건수", height=350,
+                    )
+                    _exp = st.session_state.flow_exporter
+                    ok, msg = _exp.publish_chart(
+                        user_id=st.session_state.user_id, fig=_fig_qr, code="",
+                        question=f"{_ds_label} 품질 리포트", dataset_name=_ds_label,
+                    )
+                    st.success(msg) if ok else st.error(msg)
+
     # ── EDA ──
     with st.expander("EDA", expanded=False):
         _loaded_ds = st.session_state.get("datasets", {})
@@ -2167,13 +2210,30 @@ if st.session_state.df is not None:
         eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs(["기술통계", "분포", "상관관계", "이상치"])
 
         with eda_tab1:
-            st.dataframe(_eda_df[_eda_numeric].describe().T if _eda_numeric else pd.DataFrame(), use_container_width=True)
+            _desc_df = _eda_df[_eda_numeric].describe().T if _eda_numeric else pd.DataFrame()
+            st.dataframe(_desc_df, use_container_width=True)
             cat_cols = _eda_df.select_dtypes(include="object").columns.tolist()
             if cat_cols:
                 st.caption(f"범주형 컬럼: {', '.join(cat_cols)}")
                 for cc in cat_cols[:5]:
                     vc = _eda_df[cc].value_counts().head(10)
                     st.caption(f"`{cc}` 상위 {len(vc)}개: {', '.join(f'{k}({v})' for k, v in vc.items())}")
+            if _eda_numeric and _PLOTLY_AVAILABLE and st.session_state.get("flow_exporter"):
+                if st.button("📤 기술통계 게시", key=f"pub_desc_{_eda_ds_name}"):
+                    # describe를 Plotly 테이블로 변환
+                    _desc_reset = _desc_df.reset_index().rename(columns={"index": "변수"})
+                    _fig_desc = go.Figure(data=[go.Table(
+                        header=dict(values=list(_desc_reset.columns), fill_color='#4472C4', font=dict(color='white', size=11), align='center'),
+                        cells=dict(values=[_desc_reset[c].round(2) if _desc_reset[c].dtype != 'object' else _desc_reset[c] for c in _desc_reset.columns],
+                                   fill_color='#D9E2F3', align='center', font=dict(size=10)),
+                    )])
+                    _fig_desc.update_layout(title=f"{_eda_ds_name} 기술통계", height=max(300, len(_desc_df) * 35 + 80))
+                    _exp = st.session_state.flow_exporter
+                    ok, msg = _exp.publish_chart(
+                        user_id=st.session_state.user_id, fig=_fig_desc, code="",
+                        question=f"{_eda_ds_name} 기술통계", dataset_name=_eda_ds_name,
+                    )
+                    st.success(msg) if ok else st.error(msg)
 
         with eda_tab2:
             if _eda_numeric and _PLOTLY_AVAILABLE:
@@ -2185,6 +2245,13 @@ if st.session_state.df is not None:
                     _fig_dist = px.histogram(_dist_data, x=_dist_col, marginal="box", title=f"{_dist_col} 분포")
                     _fig_dist.update_layout(height=400)
                     st.plotly_chart(_fig_dist, use_container_width=True)
+                    if st.session_state.get("flow_exporter") and st.button("📤 분포 차트 게시", key=f"pub_dist_{_eda_ds_name}"):
+                        _exp = st.session_state.flow_exporter
+                        ok, msg = _exp.publish_chart(
+                            user_id=st.session_state.user_id, fig=_fig_dist, code="",
+                            question=f"{_dist_col} 분포", dataset_name=_eda_ds_name,
+                        )
+                        st.success(msg) if ok else st.error(msg)
             else:
                 st.info("수치형 컬럼이 없거나 Plotly가 설치되지 않았습니다.")
 
@@ -2203,6 +2270,13 @@ if st.session_state.df is not None:
                     for pair, vals in _stat_tests.items():
                         sig = "✅" if vals["significant"] else "❌"
                         st.caption(f"`{pair}`: r={vals['r']}, p={vals['p']} {sig}")
+                if st.session_state.get("flow_exporter") and st.button("📤 상관관계 히트맵 게시", key=f"pub_corr_{_eda_ds_name}"):
+                    _exp = st.session_state.flow_exporter
+                    ok, msg = _exp.publish_chart(
+                        user_id=st.session_state.user_id, fig=_fig_corr, code="",
+                        question="상관관계 히트맵", dataset_name=_eda_ds_name,
+                    )
+                    st.success(msg) if ok else st.error(msg)
             else:
                 st.info("수치형 컬럼이 2개 이상 필요합니다.")
 
@@ -2216,6 +2290,13 @@ if st.session_state.df is not None:
                 for col, cnt in _outlier_detail.items():
                     pct = round(cnt / len(_eda_df) * 100, 2)
                     st.caption(f"`{col}`: {cnt:,}건 ({pct}%)")
+                if st.session_state.get("flow_exporter") and st.button("📤 이상치 차트 게시", key=f"pub_outlier_{_eda_ds_name}"):
+                    _exp = st.session_state.flow_exporter
+                    ok, msg = _exp.publish_chart(
+                        user_id=st.session_state.user_id, fig=_fig_box, code="",
+                        question="이상치 분포 (IQR)", dataset_name=_eda_ds_name,
+                    )
+                    st.success(msg) if ok else st.error(msg)
             else:
                 st.info("IQR 기준 이상치가 감지되지 않았습니다.")
 
