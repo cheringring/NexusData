@@ -607,14 +607,21 @@ class DataikuFlowExporter:
         settings.save()
         print(f"[FlowExporter] 대시보드 타일 추가 완료: {label}")
 
+    RECIPE_NAME = "compute_nexusdata_flow"
+
     def publish_recipe(self, code: str, input_datasets: List[str],
-                       output_name: str = "", recipe_name: str = "",
                        label: str = "",
                        connection: str = "filesystem_managed") -> Tuple[bool, str]:
-        """LLM 생성 코드를 Dataiku Flow에 Python 레시피로 게시.
+        """LLM 생성 코드를 Dataiku Flow의 단일 Python 레시피에 누적 게시.
 
-        기존 nexusdata_flow 레시피가 있으면 코드만 업데이트하고,
-        없으면 새로 생성합니다. Flow가 복잡해지지 않도록 단일 레시피를 유지합니다.
+        구조:
+        EL_Sensor ──┐
+                    ├── [nexusdata_flow 레시피] ──┬── nexus_left_join
+        EL_Vibration┘                            ├── nexus_merge
+                                                 └── nexus_filter_top5
+
+        - 레시피가 없으면 새로 생성
+        - 레시피가 있으면 기존 코드 뒤에 새 코드 블록을 append + 출력 데이터셋 추가
         """
         if not self._in_dataiku:
             return False, "Dataiku 연결이 필요합니다 (로컬 모드에서는 사용 불가)"
@@ -624,81 +631,134 @@ class DataikuFlowExporter:
             client = dataiku.api_client()
             project = client.get_default_project()
 
-            # 고정 레시피/출력 이름 (Flow 깔끔하게 유지)
-            fixed_recipe_name = "compute_nexusdata_flow"
-            fixed_output_name = "nexusdata_flow"
-            display_label = label[:40] if label else "NexusData 처리 결과"
+            # 출력 데이터셋 이름 생성
+            slug = self._make_slug(label) if label else datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_name = f"nexus_{slug}"
+            display_label = label[:50] if label else out_name
 
-            # 코드를 Dataiku recipe 형식으로 변환
-            recipe_code = self._convert_to_recipe_code(code, input_datasets, fixed_output_name)
+            # 이름 중복 방지
+            existing_ds = [d["name"] for d in project.list_datasets()]
+            if out_name in existing_ds:
+                out_name = f"{out_name}_{datetime.now().strftime('%H%M%S')}"
 
-            # 기존 레시피가 있는지 확인
+            # 이 블록의 코드 변환
+            block_code = self._make_code_block(code, input_datasets, out_name, display_label)
+
             existing_recipes = [r["name"] for r in project.list_recipes()]
-            if fixed_recipe_name in existing_recipes:
-                # 기존 레시피 코드만 업데이트
-                recipe = project.get_recipe(fixed_recipe_name)
+
+            if self.RECIPE_NAME in existing_recipes:
+                # ── 기존 레시피에 코드 append + 출력 추가 ──
+                recipe = project.get_recipe(self.RECIPE_NAME)
                 settings = recipe.get_settings()
-                settings.set_code(recipe_code)
+
+                # 기존 코드 뒤에 새 블록 추가
+                old_code = settings.get_code()
+                new_code = old_code + "\n\n" + block_code
+                settings.set_code(new_code)
+
+                # 출력 데이터셋 추가 (기존 출력은 유지)
+                raw = settings.get_raw()
+                outputs = raw.get("outputs", {})
+                main_outputs = outputs.get("main", {}).get("items", [])
+                main_outputs.append({"ref": out_name, "appendMode": False})
+                outputs["main"] = {"items": main_outputs}
+                raw["outputs"] = outputs
+
+                # 출력 데이터셋 생성 (managed dataset)
+                try:
+                    project.create_dataset(out_name, type="Filesystem",
+                                           params={"connection": connection,
+                                                   "path": f"/{project.project_key}/{out_name}"})
+                except Exception:
+                    pass  # 이미 존재하면 무시
+
                 settings.save()
-                return True, f"✅ Flow 레시피 업데이트: {display_label}"
+                return True, f"✅ 레시피에 추가: {display_label} → {out_name}"
             else:
-                # 새 레시피 생성
+                # ── 새 레시피 생성 ──
+                header = self._make_header(input_datasets)
+                full_code = header + "\n\n" + block_code
+
                 builder = project.new_recipe("python")
                 for ds_name in input_datasets:
                     builder.with_input(ds_name)
-                builder.with_new_output_dataset(fixed_output_name, connection)
-                builder.with_script(recipe_code)
+                builder.with_new_output_dataset(out_name, connection)
+                builder.with_script(full_code)
                 recipe = builder.create()
-                return True, f"✅ Flow 레시피 생성: {display_label} → {fixed_output_name}"
+                return True, f"✅ Flow 레시피 생성: {display_label} → {out_name}"
         except Exception as e:
             return False, f"레시피 게시 실패: {str(e)}"
 
     @staticmethod
-    def _convert_to_recipe_code(code: str, input_datasets: List[str],
-                                output_name: str) -> str:
-        """웹앱용 코드를 Dataiku recipe 형식으로 변환.
+    def _make_slug(text: str) -> str:
+        """프롬프트에서 Flow 이름용 slug 생성"""
+        keyword_map = {
+            "left join": "left_join", "inner join": "inner_join",
+            "right join": "right_join", "outer join": "outer_join",
+            "병합": "merge", "조인": "join", "필터": "filter",
+            "필터링": "filter", "그룹바이": "groupby", "그룹": "group",
+            "피벗": "pivot", "정렬": "sort", "결측": "missing",
+            "이상치": "outlier", "상관": "corr", "평균": "mean",
+            "중앙값": "median", "분포": "dist", "추출": "extract",
+            "상위": "top", "하위": "bottom", "구간": "range",
+        }
+        slug = text.lower()
+        for kr, en in keyword_map.items():
+            if kr in slug:
+                slug = en
+                break
+        else:
+            slug = re.sub(r'[^a-zA-Z0-9_\s]', '', slug)
+            slug = '_'.join(slug.split()[:4])
+        slug = re.sub(r'[^a-zA-Z0-9_]', '', slug)
+        return slug[:30] if slug else datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        변환 규칙:
-        - df = ... 로드 부분 → dataiku.Dataset().get_dataframe()
-        - result_df 또는 마지막 DataFrame → output_dataset.write_with_schema()
-        - import 문은 유지
-        - fig 관련 코드는 제거 (레시피에서는 불필요)
-        """
-        lines = ["import dataiku", "import pandas as pd", "import numpy as np", ""]
-
-        # 입력 데이터셋 로드 코드 생성
-        for i, ds_name in enumerate(input_datasets):
-            safe_name = re.sub(r'[^\w]', '_', ds_name)
-            lines.append(f"{safe_name} = dataiku.Dataset('{ds_name}').get_dataframe()")
+    @staticmethod
+    def _make_header(input_datasets: List[str]) -> str:
+        """레시피 최초 생성 시 공통 헤더 (import + 데이터셋 로드)"""
+        lines = [
+            "import dataiku",
+            "import pandas as pd",
+            "import numpy as np",
+            "",
+        ]
+        for ds_name in input_datasets:
+            safe = re.sub(r'[^\w]', '_', ds_name)
+            lines.append(f"{safe} = dataiku.Dataset('{ds_name}').get_dataframe()")
         if input_datasets:
             first_safe = re.sub(r'[^\w]', '_', input_datasets[0])
             lines.append(f"df = {first_safe}")
-        lines.append("")
+        return "\n".join(lines)
 
-        # 원본 코드에서 import, df 로드, fig 관련 라인 제거
+    @staticmethod
+    def _make_code_block(code: str, input_datasets: List[str],
+                         output_name: str, label: str) -> str:
+        """하나의 게시 요청을 독립 코드 블록으로 변환"""
+        lines = [
+            f"# {'=' * 50}",
+            f"# {label}",
+            f"# {'=' * 50}",
+        ]
+
         for line in code.split("\n"):
             stripped = line.strip()
-            # 이미 추가한 import는 스킵
             if stripped.startswith("import dataiku") or stripped.startswith("import pandas") or stripped.startswith("import numpy"):
                 continue
-            # fig 관련 코드 스킵
             if any(kw in stripped for kw in ["fig =", "fig.", "px.", "go.", "plt.", "st.", "make_subplots"]):
                 continue
-            # plotly/matplotlib import 스킵
             if "plotly" in stripped or "matplotlib" in stripped or "seaborn" in stripped:
                 continue
             lines.append(line)
 
-        # 출력 코드 추가
         lines.append("")
-        lines.append(f"# 결과 저장")
-        lines.append(f"output_ds = dataiku.Dataset('{output_name}')")
-        lines.append("if 'result_df' in dir():")
-        lines.append("    output_ds.write_with_schema(result_df)")
-        lines.append("elif 'merged_df' in dir():")
-        lines.append("    output_ds.write_with_schema(merged_df)")
-        lines.append("else:")
-        lines.append("    output_ds.write_with_schema(df)")
+        lines.append(f"# 결과 저장 → {output_name}")
+        lines.append(f"_out_{output_name} = dataiku.Dataset('{output_name}')")
+        lines.append(f"if 'result_df' in dir() and result_df is not None:")
+        lines.append(f"    _out_{output_name}.write_with_schema(result_df)")
+        lines.append(f"elif 'merged_df' in dir() and merged_df is not None:")
+        lines.append(f"    _out_{output_name}.write_with_schema(merged_df)")
+        lines.append(f"else:")
+        lines.append(f"    _out_{output_name}.write_with_schema(df)")
 
         return "\n".join(lines)
 
