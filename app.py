@@ -430,12 +430,16 @@ class DataikuFlowExporter:
                     chart_title = t.text
         except Exception:
             pass
-        # 라벨: 데이터셋명 + 차트 제목 (또는 질문 요약)
-        _ds_tag = f"[{dataset_name}] " if dataset_name else ""
-        if chart_title:
-            label = f"{_ds_tag}{chart_title}"
+        # 라벨: 데이터셋명 + 차트 제목 (또는 질문 요약), 중복 방지
+        _ds_tag = f"[{dataset_name}]" if dataset_name else ""
+        _title_or_q = chart_title if chart_title else (question[:60] if question else "분석 결과")
+        # 차트 제목에 이미 데이터셋명이 포함되어 있으면 태그 생략
+        if dataset_name and dataset_name in _title_or_q:
+            label = _title_or_q
+        elif _ds_tag:
+            label = f"{_ds_tag} {_title_or_q}"
         else:
-            label = f"{_ds_tag}{question[:60]}" if question else f"{_ds_tag}분석 결과"
+            label = _title_or_q
 
         if self._in_dataiku:
             try:
@@ -595,6 +599,101 @@ class DataikuFlowExporter:
         settings.save()
         print(f"[FlowExporter] 대시보드 타일 추가 완료: {label}")
 
+    def publish_recipe(self, code: str, input_datasets: List[str],
+                       output_name: str, recipe_name: str = "",
+                       connection: str = "filesystem_managed") -> Tuple[bool, str]:
+        """LLM 생성 코드를 Dataiku Flow에 Python 레시피로 게시.
+
+        Args:
+            code: 실행할 Python 코드 (df 기반 → recipe 형식으로 자동 변환)
+            input_datasets: 입력 데이터셋 이름 리스트
+            output_name: 출력 데이터셋 이름
+            recipe_name: 레시피 이름 (빈 문자열이면 자동 생성)
+            connection: 출력 데이터셋 연결 (기본: filesystem_managed)
+        """
+        if not self._in_dataiku:
+            return False, "Dataiku 연결이 필요합니다 (로컬 모드에서는 사용 불가)"
+
+        try:
+            import dataiku
+            client = dataiku.api_client()
+            project = client.get_default_project()
+
+            # 레시피 이름 자동 생성
+            if not recipe_name:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                recipe_name = f"nexusdata_recipe_{ts}"
+
+            # 코드를 Dataiku recipe 형식으로 변환
+            recipe_code = self._convert_to_recipe_code(code, input_datasets, output_name)
+
+            builder = project.new_recipe("python")
+
+            # 입력 데이터셋 설정
+            for ds_name in input_datasets:
+                builder.with_input(ds_name)
+
+            # 출력 데이터셋 생성
+            builder.with_new_output_dataset(output_name, connection)
+
+            # 코드 설정
+            builder.with_script(recipe_code)
+
+            recipe = builder.create()
+
+            return True, f"✅ Flow 레시피 게시 완료: {recipe_name} → {output_name}"
+        except Exception as e:
+            return False, f"레시피 게시 실패: {str(e)}"
+
+    @staticmethod
+    def _convert_to_recipe_code(code: str, input_datasets: List[str],
+                                output_name: str) -> str:
+        """웹앱용 코드를 Dataiku recipe 형식으로 변환.
+
+        변환 규칙:
+        - df = ... 로드 부분 → dataiku.Dataset().get_dataframe()
+        - result_df 또는 마지막 DataFrame → output_dataset.write_with_schema()
+        - import 문은 유지
+        - fig 관련 코드는 제거 (레시피에서는 불필요)
+        """
+        lines = ["import dataiku", "import pandas as pd", "import numpy as np", ""]
+
+        # 입력 데이터셋 로드 코드 생성
+        for i, ds_name in enumerate(input_datasets):
+            safe_name = re.sub(r'[^\w]', '_', ds_name)
+            lines.append(f"{safe_name} = dataiku.Dataset('{ds_name}').get_dataframe()")
+        if input_datasets:
+            first_safe = re.sub(r'[^\w]', '_', input_datasets[0])
+            lines.append(f"df = {first_safe}")
+        lines.append("")
+
+        # 원본 코드에서 import, df 로드, fig 관련 라인 제거
+        for line in code.split("\n"):
+            stripped = line.strip()
+            # 이미 추가한 import는 스킵
+            if stripped.startswith("import dataiku") or stripped.startswith("import pandas") or stripped.startswith("import numpy"):
+                continue
+            # fig 관련 코드 스킵
+            if any(kw in stripped for kw in ["fig =", "fig.", "px.", "go.", "plt.", "st.", "make_subplots"]):
+                continue
+            # plotly/matplotlib import 스킵
+            if "plotly" in stripped or "matplotlib" in stripped or "seaborn" in stripped:
+                continue
+            lines.append(line)
+
+        # 출력 코드 추가
+        lines.append("")
+        lines.append(f"# 결과 저장")
+        lines.append(f"output_ds = dataiku.Dataset('{output_name}')")
+        lines.append("if 'result_df' in dir():")
+        lines.append("    output_ds.write_with_schema(result_df)")
+        lines.append("elif 'merged_df' in dir():")
+        lines.append("    output_ds.write_with_schema(merged_df)")
+        lines.append("else:")
+        lines.append("    output_ds.write_with_schema(df)")
+
+        return "\n".join(lines)
+
 
 
 # ================================================================
@@ -621,6 +720,13 @@ STRICT RULES:
 7. Store the final figure in a variable named 'fig'.
    - plotly (DEFAULT): fig = px.scatter(...) or fig = go.Figure(...)
    - matplotlib (only if user explicitly requests): fig, ax = plt.subplots(...)
+   - **DATA PROCESSING REQUESTS** (병합, 조인, 필터링, 피벗 등 차트 없이 데이터 결과만 필요한 경우):
+     결과 DataFrame을 'result_df' 변수에 저장하세요. fig는 생성하지 않아도 됩니다.
+     예: result_df = pd.merge(EL_Sensor, EL_Vibration, on='ID', how='left')
+     예: result_df = df[df['vibration'] > 20].reset_index(drop=True)
+     사용자가 "병합해줘", "조인해줘", "필터링해줘", "정렬해줘", "피벗해줘", "그룹바이해줘" 등
+     데이터 처리만 요청하고 시각화를 명시하지 않으면 result_df만 저장하세요.
+     단, 사용자가 "보여줘", "그려줘", "차트", "그래프", "플롯" 등 시각화를 요청하면 fig를 생성하세요.
 8. NEVER use: os, sys, subprocess, open(), eval(), exec(), __import__, requests, urllib
 9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
 9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
@@ -1361,15 +1467,16 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
-def _check_fig_assignment(tree: ast.AST) -> bool:
+def _check_fig_or_result_assignment(tree: ast.AST) -> bool:
+    """fig 또는 result_df 변수 할당 여부 확인"""
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "fig":
+                if isinstance(target, ast.Name) and target.id in ("fig", "result_df"):
                     return True
                 if isinstance(target, ast.Tuple):
                     for elt in target.elts:
-                        if isinstance(elt, ast.Name) and elt.id == "fig":
+                        if isinstance(elt, ast.Name) and elt.id in ("fig", "result_df"):
                             return True
     return False
 
@@ -1437,8 +1544,8 @@ class CodeValidator:
             if invalid_columns:
                 return False, f"존재하지 않는 컬럼: {', '.join(invalid_columns)}\n\n사용 가능한 컬럼: {', '.join(available_columns)}"
         
-        if not _check_fig_assignment(tree):
-            return True, "WARNING: 'fig' 변수가 코드에 없습니다. 차트가 표시되지 않을 수 있습니다."
+        if not _check_fig_or_result_assignment(tree):
+            return True, "WARNING: 'fig' 또는 'result_df' 변수가 코드에 없습니다."
         return True, None
 
     @staticmethod
@@ -1520,8 +1627,8 @@ fig.update_layout(dragmode='zoom')
 # ================================================================
 
 class CodeExecutor:
-    # 실행 결과 캐시: {hash(code + df_shape): (fig, error)}
-    _result_cache: Dict[str, Tuple[Optional[Any], Optional[str]]] = {}
+    # 실행 결과 캐시: {hash(code + df_shape): (fig, result_df, error)}
+    _result_cache: Dict[str, Tuple[Optional[Any], Optional[Any], Optional[str]]] = {}
 
     @staticmethod
     def _make_cache_key(code: str, df: pd.DataFrame) -> str:
@@ -1530,7 +1637,7 @@ class CodeExecutor:
         return hashlib.md5(content.encode()).hexdigest()
 
     @staticmethod
-    def execute(code: str, df: pd.DataFrame, datasets: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    def execute(code: str, df: pd.DataFrame, datasets: Optional[Dict[str, pd.DataFrame]] = None) -> Tuple[Optional[Any], Optional[pd.DataFrame], Optional[str]]:
         cache_key = CodeExecutor._make_cache_key(code, df)
         if cache_key in CodeExecutor._result_cache:
             return CodeExecutor._result_cache[cache_key]
@@ -1591,18 +1698,19 @@ class CodeExecutor:
             thread.join(timeout=60)  # 60초 타임아웃 (멀티 데이터셋 병합 + 복합 분석 고려)
             
             if thread.is_alive():
-                return None, "코드 실행 시간 초과 (60초). 데이터가 너무 크거나 복잡한 연산입니다.\n\n💡 팁: Python for 루프 대신 pandas 벡터 연산(isin, shift, rolling 등)을 사용하면 빨라집니다."
+                return None, None, "코드 실행 시간 초과 (60초). 데이터가 너무 크거나 복잡한 연산입니다.\n\n💡 팁: Python for 루프 대신 pandas 벡터 연산(isin, shift, rolling 등)을 사용하면 빨라집니다."
             
             if exec_error_holder[0] is not None:
                 raise exec_error_holder[0]
             
             fig = namespace.get("fig")
+            result_df = namespace.get("result_df")
             if fig is None:
                 current_fig = plt.gcf()
                 if current_fig.get_axes():
                     fig = current_fig
-            if fig is None:
-                return None, "'fig' 변수가 생성되지 않았습니다."
+            if fig is None and result_df is None:
+                return None, None, "'fig' 또는 'result_df' 변수가 생성되지 않았습니다."
             
             # Plotly figure의 Interval 객체를 문자열로 변환 (pd.cut 결과 직렬화 오류 방지)
             if _PLOTLY_AVAILABLE and hasattr(fig, 'data'):
@@ -1621,40 +1729,40 @@ class CodeExecutor:
                 n_shapes = len(fig.layout.shapes) if fig.layout.shapes else 0
                 n_annotations = len(fig.layout.annotations) if fig.layout.annotations else 0
                 if n_shapes > 50:
-                    return None, (
+                    return None, None, (
                         f"⚠️ Shape이 {n_shapes}개 생성되어 브라우저가 멈출 수 있습니다.\n\n"
                         "💡 이상치 구간 표시는 add_vrect 반복 대신, "
                         "Scattergl 마커 트레이스로 표시하세요.\n"
                         "예: outlier 위치에만 빨간 점을 찍는 방식"
                     )
                 if n_annotations > 50:
-                    return None, f"⚠️ Annotation이 {n_annotations}개 생성되어 브라우저가 멈출 수 있습니다. 개수를 줄여주세요."
+                    return None, None, f"⚠️ Annotation이 {n_annotations}개 생성되어 브라우저가 멈출 수 있습니다. 개수를 줄여주세요."
             
-            result = fig, None
+            result = fig, result_df, None
             CodeExecutor._result_cache[cache_key] = result
             return result
         except KeyError as e:
-            result = None, f"컬럼을 찾을 수 없습니다: {e}\n사용 가능한 컬럼: {df.columns.tolist()}"
+            result = None, None, f"컬럼을 찾을 수 없습니다: {e}\n사용 가능한 컬럼: {df.columns.tolist()}"
             CodeExecutor._result_cache[cache_key] = result
             return result
         except ValueError as e:
-            result = None, f"값 오류: {str(e)}"
+            result = None, None, f"값 오류: {str(e)}"
             CodeExecutor._result_cache[cache_key] = result
             return result
         except TypeError as e:
-            result = None, f"타입 오류: {str(e)}"
+            result = None, None, f"타입 오류: {str(e)}"
             CodeExecutor._result_cache[cache_key] = result
             return result
         except AttributeError as e:
-            result = None, f"속성 오류: {str(e)}\n(객체에 해당 메서드/속성이 없습니다)"
+            result = None, None, f"속성 오류: {str(e)}\n(객체에 해당 메서드/속성이 없습니다)"
             CodeExecutor._result_cache[cache_key] = result
             return result
         except NameError as e:
-            result = None, f"변수명 오류: {str(e)}\n(정의되지 않은 변수를 사용했습니다)"
+            result = None, None, f"변수명 오류: {str(e)}\n(정의되지 않은 변수를 사용했습니다)"
             CodeExecutor._result_cache[cache_key] = result
             return result
         except Exception as e:
-            result = None, f"실행 오류 ({type(e).__name__}): {str(e)}\n\n{traceback.format_exc()}"
+            result = None, None, f"실행 오류 ({type(e).__name__}): {str(e)}\n\n{traceback.format_exc()}"
             CodeExecutor._result_cache[cache_key] = result
             return result
 
@@ -1977,6 +2085,19 @@ def _init_session():
             st.session_state[key] = val
 
 _init_session()
+
+# ── 마지막 대화 자동 복원 (Gemini 스타일) ──
+if not st.session_state.get("_history_restored"):
+    _hm = st.session_state.history_manager
+    _uid = st.session_state.user_id
+    _histories = _hm.list_user_histories(_uid)
+    if _histories and not st.session_state.messages:
+        _last = _histories[0]  # 가장 최근 대화
+        _saved = _hm.load_history(_uid, _last["dataset"])
+        if _saved:
+            st.session_state.messages = _saved
+            st.session_state.selected_dataset = _last["dataset"]
+    st.session_state["_history_restored"] = True
 
 # ================================================================
 # 사이드바
@@ -2339,6 +2460,50 @@ for msg in st.session_state.messages:
                     st.plotly_chart(fig, use_container_width=True)
                 elif CodeExecutor.is_matplotlib_figure(fig):
                     st.pyplot(fig, use_container_width=True)
+            # 결과 데이터프레임 표시
+            if msg.get("result_df") is not None:
+                _rdf = msg["result_df"]
+                st.dataframe(_rdf, use_container_width=True, height=min(400, 35 * len(_rdf) + 38))
+                st.caption(f"{_rdf.shape[0]:,}행 × {_rdf.shape[1]}열")
+                # Flow 레시피 게시 버튼
+                _btn_col1, _btn_col2 = st.columns(2)
+                with _btn_col1:
+                    if st.button("📤 대시보드 게시 (테이블)", key=f"pub_tbl_{msg_idx}", use_container_width=True):
+                        # result_df를 Plotly Table로 변환해서 게시
+                        _tbl_fig = go.Figure(data=[go.Table(
+                            header=dict(values=list(_rdf.columns), fill_color='#4472C4',
+                                        font=dict(color='white', size=11), align='center'),
+                            cells=dict(values=[_rdf[c].head(100) for c in _rdf.columns],
+                                       fill_color='#D9E2F3', align='center', font=dict(size=10)),
+                        )])
+                        _tbl_fig.update_layout(title=f"데이터 처리 결과 ({_rdf.shape[0]:,}행)", height=400)
+                        _exp = st.session_state.flow_exporter
+                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                        ok, _msg = _exp.publish_chart(
+                            user_id=st.session_state.user_id, fig=_tbl_fig, code=msg.get("code", ""),
+                            question=_user_q, dataset_name=st.session_state.selected_dataset or '',
+                        )
+                        if ok:
+                            st.success(_msg)
+                        else:
+                            st.error(_msg)
+                with _btn_col2:
+                    if st.button("🔧 Flow 레시피 게시", key=f"pub_recipe_{msg_idx}", use_container_width=True):
+                        _exp = st.session_state.flow_exporter
+                        _ds_names = list(st.session_state.get("datasets", {}).keys())
+                        if not _ds_names:
+                            _ds_names = [st.session_state.selected_dataset or "dataset"]
+                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else 'result'
+                        _out_name = f"nexusdata_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        ok, _msg = _exp.publish_recipe(
+                            code=msg.get("code", ""),
+                            input_datasets=_ds_names,
+                            output_name=_out_name,
+                        )
+                        if ok:
+                            st.success(_msg)
+                        else:
+                            st.error(_msg)
             if msg.get("insight"):
                 st.info(f"**인사이트**: {msg['insight']}")
             # 코드 보기 (전체 너비)
@@ -2536,7 +2701,7 @@ if prompt:
                 if not is_safe:
                     error_msg = f"검증 실패: {validation_msg}"
                 else:
-                    fig, exec_error = CodeExecutor.execute(code, df, datasets=datasets)
+                    fig, result_df, exec_error = CodeExecutor.execute(code, df, datasets=datasets)
 
                     if exec_error:
                         # 자동 재시도 (Self-Correction)
@@ -2556,11 +2721,11 @@ if prompt:
                             if not is_safe2:
                                 break
 
-                            fig, exec_error = CodeExecutor.execute(code, df, datasets=datasets)
-                            if fig is not None:
+                            fig, result_df, exec_error = CodeExecutor.execute(code, df, datasets=datasets)
+                            if fig is not None or result_df is not None:
                                 break
 
-                        if exec_error and fig is None:
+                        if exec_error and fig is None and result_df is None:
                             error_msg = f"코드 실행 실패 (자동 수정 {MAX_AUTO_RETRY}회 후):\n\n```\n{exec_error}\n```"
 
         except Exception as e:
@@ -2584,10 +2749,16 @@ if prompt:
             except Exception:
                 insight = None
 
-            assistant_msg["text"]    = "차트가 생성되었습니다."
-            assistant_msg["fig"]     = fig
-            assistant_msg["code"]    = code
-            assistant_msg["insight"] = insight
+            if fig is not None:
+                assistant_msg["text"] = "차트가 생성되었습니다."
+            elif result_df is not None:
+                assistant_msg["text"] = f"데이터 처리 완료 ({result_df.shape[0]:,}행 × {result_df.shape[1]}열)"
+            else:
+                assistant_msg["text"] = "처리가 완료되었습니다."
+            assistant_msg["fig"]        = fig
+            assistant_msg["result_df"]  = result_df
+            assistant_msg["code"]       = code
+            assistant_msg["insight"]    = insight
 
         st.session_state.messages.append(assistant_msg)
         
@@ -2597,7 +2768,7 @@ if prompt:
             user_id = st.session_state.user_id
             messages_to_save = []
             for msg in st.session_state.messages:
-                msg_copy = {k: v for k, v in msg.items() if k != "fig"}
+                msg_copy = {k: v for k, v in msg.items() if k not in ("fig", "result_df")}
                 messages_to_save.append(msg_copy)
             # 데이터셋명 목록으로 타이틀 생성
             ds_names = list(st.session_state.get('datasets', {}).keys())
