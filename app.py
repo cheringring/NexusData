@@ -21,6 +21,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 import streamlit as st
+
+# .env 파일에서 환경변수 로드
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import matplotlib
 matplotlib.use("Agg")  # pyplot import 전에 반드시 설정
 import matplotlib.pyplot as plt
@@ -58,9 +66,9 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = "OPENAI_KEY_REMOVED"
-_ANTHROPIC_API_KEY = "여기에_Anthropic_API_KEY_입력"  # sk-ant-...
-_GROQ_API_KEY      = "GROQ_KEY_REMOVED"  
+_OPENAI_API_KEY    = "REMOVED"
+_ANTHROPIC_API_KEY = ""
+_GROQ_API_KEY      = ""
 # ================================================================
 # HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
@@ -600,16 +608,13 @@ class DataikuFlowExporter:
         print(f"[FlowExporter] 대시보드 타일 추가 완료: {label}")
 
     def publish_recipe(self, code: str, input_datasets: List[str],
-                       output_name: str, recipe_name: str = "",
+                       output_name: str = "", recipe_name: str = "",
+                       label: str = "",
                        connection: str = "filesystem_managed") -> Tuple[bool, str]:
         """LLM 생성 코드를 Dataiku Flow에 Python 레시피로 게시.
 
-        Args:
-            code: 실행할 Python 코드 (df 기반 → recipe 형식으로 자동 변환)
-            input_datasets: 입력 데이터셋 이름 리스트
-            output_name: 출력 데이터셋 이름
-            recipe_name: 레시피 이름 (빈 문자열이면 자동 생성)
-            connection: 출력 데이터셋 연결 (기본: filesystem_managed)
+        기존 nexusdata_flow 레시피가 있으면 코드만 업데이트하고,
+        없으면 새로 생성합니다. Flow가 복잡해지지 않도록 단일 레시피를 유지합니다.
         """
         if not self._in_dataiku:
             return False, "Dataiku 연결이 필요합니다 (로컬 모드에서는 사용 불가)"
@@ -619,29 +624,32 @@ class DataikuFlowExporter:
             client = dataiku.api_client()
             project = client.get_default_project()
 
-            # 레시피 이름 자동 생성
-            if not recipe_name:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                recipe_name = f"nexusdata_recipe_{ts}"
+            # 고정 레시피/출력 이름 (Flow 깔끔하게 유지)
+            fixed_recipe_name = "compute_nexusdata_flow"
+            fixed_output_name = "nexusdata_flow"
+            display_label = label[:40] if label else "NexusData 처리 결과"
 
             # 코드를 Dataiku recipe 형식으로 변환
-            recipe_code = self._convert_to_recipe_code(code, input_datasets, output_name)
+            recipe_code = self._convert_to_recipe_code(code, input_datasets, fixed_output_name)
 
-            builder = project.new_recipe("python")
-
-            # 입력 데이터셋 설정
-            for ds_name in input_datasets:
-                builder.with_input(ds_name)
-
-            # 출력 데이터셋 생성
-            builder.with_new_output_dataset(output_name, connection)
-
-            # 코드 설정
-            builder.with_script(recipe_code)
-
-            recipe = builder.create()
-
-            return True, f"✅ Flow 레시피 게시 완료: {recipe_name} → {output_name}"
+            # 기존 레시피가 있는지 확인
+            existing_recipes = [r["name"] for r in project.list_recipes()]
+            if fixed_recipe_name in existing_recipes:
+                # 기존 레시피 코드만 업데이트
+                recipe = project.get_recipe(fixed_recipe_name)
+                settings = recipe.get_settings()
+                settings.set_code(recipe_code)
+                settings.save()
+                return True, f"✅ Flow 레시피 업데이트: {display_label}"
+            else:
+                # 새 레시피 생성
+                builder = project.new_recipe("python")
+                for ds_name in input_datasets:
+                    builder.with_input(ds_name)
+                builder.with_new_output_dataset(fixed_output_name, connection)
+                builder.with_script(recipe_code)
+                recipe = builder.create()
+                return True, f"✅ Flow 레시피 생성: {display_label} → {fixed_output_name}"
         except Exception as e:
             return False, f"레시피 게시 실패: {str(e)}"
 
@@ -1937,7 +1945,7 @@ def _load_api_key(provider: str) -> Optional[str]:
         "groq": _GROQ_API_KEY,
     }
     key = hardcoded.get(provider, "")
-    if key and not key.startswith("여기에"):
+    if key and not key.startswith("여기에") and not key.endswith("REMOVED") and len(key) > 10:
         return key
 
     key_names = {
@@ -2465,71 +2473,65 @@ for msg in st.session_state.messages:
                 _rdf = msg["result_df"]
                 st.dataframe(_rdf, use_container_width=True, height=min(400, 35 * len(_rdf) + 38))
                 st.caption(f"{_rdf.shape[0]:,}행 × {_rdf.shape[1]}열")
-                # Flow 레시피 게시 버튼
-                _btn_col1, _btn_col2 = st.columns(2)
-                with _btn_col1:
-                    if st.button("📤 대시보드 게시 (테이블)", key=f"pub_tbl_{msg_idx}", use_container_width=True):
-                        # result_df를 Plotly Table로 변환해서 게시
-                        _tbl_fig = go.Figure(data=[go.Table(
-                            header=dict(values=list(_rdf.columns), fill_color='#4472C4',
-                                        font=dict(color='white', size=11), align='center'),
-                            cells=dict(values=[_rdf[c].head(100) for c in _rdf.columns],
-                                       fill_color='#D9E2F3', align='center', font=dict(size=10)),
-                        )])
-                        _tbl_fig.update_layout(title=f"데이터 처리 결과 ({_rdf.shape[0]:,}행)", height=400)
-                        _exp = st.session_state.flow_exporter
-                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
-                        ok, _msg = _exp.publish_chart(
-                            user_id=st.session_state.user_id, fig=_tbl_fig, code=msg.get("code", ""),
-                            question=_user_q, dataset_name=st.session_state.selected_dataset or '',
-                        )
-                        if ok:
-                            st.success(_msg)
-                        else:
-                            st.error(_msg)
-                with _btn_col2:
-                    if st.button("🔧 Flow 레시피 게시", key=f"pub_recipe_{msg_idx}", use_container_width=True):
-                        _exp = st.session_state.flow_exporter
-                        _ds_names = list(st.session_state.get("datasets", {}).keys())
-                        if not _ds_names:
-                            _ds_names = [st.session_state.selected_dataset or "dataset"]
-                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else 'result'
-                        _out_name = f"nexusdata_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                        ok, _msg = _exp.publish_recipe(
-                            code=msg.get("code", ""),
-                            input_datasets=_ds_names,
-                            output_name=_out_name,
-                        )
-                        if ok:
-                            st.success(_msg)
-                        else:
-                            st.error(_msg)
             if msg.get("insight"):
                 st.info(f"**인사이트**: {msg['insight']}")
-            # 코드 보기 (전체 너비)
+            # 코드 보기
             msg_idx = st.session_state.messages.index(msg)
             _has_fig = msg.get("fig") is not None
+            _has_result_df = msg.get("result_df") is not None
             _has_code = bool(msg.get("code"))
-            _has_insight = bool(msg.get("insight"))
             if _has_code:
                 with st.expander("코드 보기", expanded=False):
                     st.code(msg["code"], language="python")
-            # Flow 연동 버튼: 대시보드 게시 (JSON 메타 + Insight + 대시보드 타일)
-            if _has_fig:
-                if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
-                    _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
-                    _ds_name = st.session_state.selected_dataset or ''
-                    _exporter = st.session_state.flow_exporter
-                    _uid = st.session_state.user_id
-                    ok_chart, chart_msg = _exporter.publish_chart(
-                        user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
-                        question=_user_q, insight=msg.get("insight", ""),
-                        dataset_name=_ds_name,
-                    )
-                    if ok_chart:
-                        st.success(chart_msg)
-                    else:
-                        st.error(chart_msg)
+            # ── 게시 버튼: 대시보드 + Flow 레시피 ──
+            if _has_fig or _has_result_df:
+                _btn_col1, _btn_col2 = st.columns(2)
+                with _btn_col1:
+                    if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
+                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                        _ds_name = st.session_state.selected_dataset or ''
+                        _exporter = st.session_state.flow_exporter
+                        _uid = st.session_state.user_id
+                        if _has_fig:
+                            ok, _pub_msg = _exporter.publish_chart(
+                                user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
+                                question=_user_q, insight=msg.get("insight", ""),
+                                dataset_name=_ds_name,
+                            )
+                        else:
+                            # result_df → Plotly Table로 변환해서 게시
+                            _rdf = msg["result_df"]
+                            _tbl_fig = go.Figure(data=[go.Table(
+                                header=dict(values=list(_rdf.columns), fill_color='#4472C4',
+                                            font=dict(color='white', size=11), align='center'),
+                                cells=dict(values=[_rdf[c].head(100) for c in _rdf.columns],
+                                           fill_color='#D9E2F3', align='center', font=dict(size=10)),
+                            )])
+                            _tbl_fig.update_layout(title=f"데이터 처리 결과 ({_rdf.shape[0]:,}행)", height=400)
+                            ok, _pub_msg = _exporter.publish_chart(
+                                user_id=_uid, fig=_tbl_fig, code=msg.get("code", ""),
+                                question=_user_q, dataset_name=_ds_name,
+                            )
+                        if ok:
+                            st.success(_pub_msg)
+                        else:
+                            st.error(_pub_msg)
+                with _btn_col2:
+                    if _has_code and st.button("🔧 Flow 레시피 게시", key=f"pub_recipe_{msg_idx}", use_container_width=True):
+                        _exporter = st.session_state.flow_exporter
+                        _ds_names = list(st.session_state.get("datasets", {}).keys())
+                        if not _ds_names:
+                            _ds_names = [st.session_state.selected_dataset or "dataset"]
+                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                        ok, _pub_msg = _exporter.publish_recipe(
+                            code=msg.get("code", ""),
+                            input_datasets=_ds_names,
+                            label=_user_q[:40],
+                        )
+                        if ok:
+                            st.success(_pub_msg)
+                        else:
+                            st.error(_pub_msg)
             if msg.get("error"):
                 st.error(msg["error"])
                 retry_guide = _build_error_guide(msg["error"], st.session_state.dataset_info)
