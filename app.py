@@ -2116,7 +2116,7 @@ with st.sidebar:
         "솔루션",
         solution_list,
         index=0,
-        key="selected_solution",
+        key="sol_select",
     )
 
     st.markdown("---")
@@ -2138,11 +2138,11 @@ with st.sidebar:
     # 저장된 히스토리 목록 (Gemini 스타일)
     histories = history_manager.list_user_histories(user_id)
     if histories:
-        for hist in histories:
+        for idx, hist in enumerate(histories):
             title = hist.get('title', hist['dataset'])
             col_h, col_del = st.columns([5, 1])
             with col_h:
-                if st.button(f"{title}", key=f"hist_{hist['dataset']}", use_container_width=True):
+                if st.button(f"{title}", key=f"hist_{idx}_{hist['dataset'][:20]}", use_container_width=True):
                     try:
                         saved_messages = history_manager.load_history(user_id, hist['dataset'])
                         st.session_state.messages = saved_messages if saved_messages else []
