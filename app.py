@@ -66,7 +66,7 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = "REMOVED"
+_OPENAI_API_KEY    = ""
 _ANTHROPIC_API_KEY = ""
 _GROQ_API_KEY      = ""
 # ================================================================
@@ -223,7 +223,7 @@ class HistoryManager:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = "REMOVED"
+_OPENAI_API_KEY    = ""
 _ANTHROPIC_API_KEY = ""
 _GROQ_API_KEY      = ""
 # ================================================================
