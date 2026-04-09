@@ -66,7 +66,7 @@ except ImportError:
 # API Keys (Dataiku 웹앱 내부 전용)
 # ================================================================
 
-_OPENAI_API_KEY    = ""
+_OPENAI_API_KEY    = "REMOVED"
 _ANTHROPIC_API_KEY = ""
 _GROQ_API_KEY      = ""
 # ================================================================
@@ -74,10 +74,14 @@ _GROQ_API_KEY      = ""
 # ================================================================
 
 class HistoryManager:
-    """사용자별 채팅 히스토리를 Managed Folder(Dataiku) 또는 로컬 JSON으로 저장/복원"""
+    """사용자별 채팅 히스토리를 Managed Folder(Dataiku) 또는 로컬 JSON으로 저장/복원.
+    
+    저장 구조: _history/{user_id}/{chat_id}.json
+    각 대화는 고유 chat_id를 가지며, 여러 대화를 독립적으로 관리.
+    """
 
     FOLDER_NAME = "nexusdata_charts"
-    HISTORY_PREFIX = "_history"  # Managed Folder 내 경로: _history/{user_id}_{dataset}.json
+    HISTORY_PREFIX = "_history"
 
     def __init__(self, storage_dir: str = ".chat_history"):
         self.storage_dir = storage_dir
@@ -92,7 +96,6 @@ class HistoryManager:
 
     @staticmethod
     def get_user_id() -> str:
-        """Dataiku 사용자 ID 가져오기 (없으면 'default')"""
         try:
             import dataiku
             client = dataiku.api_client()
@@ -101,115 +104,130 @@ class HistoryManager:
         except Exception:
             return "default"
 
-    def _folder_path(self, user_id: str, dataset_name: str) -> str:
-        safe_ds_name = re.sub(r'[^\w\-]', '_', dataset_name)
-        return f"{self.HISTORY_PREFIX}/{user_id}_{safe_ds_name}.json"
+    @staticmethod
+    def new_chat_id() -> str:
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    def get_history_file(self, user_id: str, dataset_name: str) -> str:
-        safe_ds_name = re.sub(r'[^\w\-]', '_', dataset_name)
-        return os.path.join(self.storage_dir, f"{user_id}_{safe_ds_name}.json")
+    def _chat_path(self, user_id: str, chat_id: str) -> str:
+        if self._in_dataiku:
+            return f"{self.HISTORY_PREFIX}/{user_id}/{chat_id}.json"
+        return os.path.join(self.storage_dir, user_id, f"{chat_id}.json")
 
-    def save_history(self, user_id: str, dataset_name: str, messages: List[dict], title: str = None) -> bool:
-        """히스토리 저장"""
+    def save_history(self, user_id: str, chat_id: str, messages: List[dict],
+                     title: str = None, dataset_name: str = "") -> bool:
         try:
             if title is None:
-                first_user_msg = next((m.get('content', '') for m in messages if m.get('role') == 'user'), '')
-                short_msg = first_user_msg[:20] + ('...' if len(first_user_msg) > 20 else '')
-                title = f"{short_msg}" if short_msg else dataset_name
+                first_msg = next((m.get('content', '') for m in messages if m.get('role') == 'user'), '')
+                title = (first_msg[:25] + '...') if len(first_msg) > 25 else first_msg
+                if not title:
+                    title = dataset_name or chat_id
             data = {
+                "chat_id": chat_id,
                 "user_id": user_id,
                 "dataset": dataset_name,
                 "title": title,
                 "last_updated": datetime.now().isoformat(),
-                "messages": messages
+                "messages": messages,
             }
             payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
             if self._in_dataiku and self._folder:
-                self._folder.upload_stream(self._folder_path(user_id, dataset_name), io.BytesIO(payload))
+                _path = self._chat_path(user_id, chat_id)
+                self._folder.upload_stream(_path, io.BytesIO(payload))
+                print(f"[HistoryManager] 저장 완료: {_path}")
             else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                with open(filepath, 'w', encoding='utf-8') as f:
+                dirpath = os.path.join(self.storage_dir, user_id)
+                os.makedirs(dirpath, exist_ok=True)
+                with open(self._chat_path(user_id, chat_id), 'w', encoding='utf-8') as f:
                     f.write(payload.decode("utf-8"))
             return True
         except Exception as e:
             print(f"히스토리 저장 실패: {e}")
             return False
 
-    def load_history(self, user_id: str, dataset_name: str) -> List[dict]:
-        """히스토리 복원"""
+    def load_history(self, user_id: str, chat_id: str) -> dict:
+        """chat_id로 대화 전체 데이터 로드. 반환: {chat_id, dataset, title, messages}"""
         try:
             if self._in_dataiku and self._folder:
-                path = self._folder_path(user_id, dataset_name)
-                try:
-                    with self._folder.get_download_stream(path) as f:
-                        data = json.loads(f.read().decode("utf-8"))
-                    return data.get("messages", [])
-                except Exception:
-                    return []
+                path = self._chat_path(user_id, chat_id)
+                with self._folder.get_download_stream(path) as f:
+                    return json.loads(f.read().decode("utf-8"))
             else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                if not os.path.exists(filepath):
-                    return []
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                return data.get("messages", [])
+                path = self._chat_path(user_id, chat_id)
+                if not os.path.exists(path):
+                    return {}
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
         except Exception as e:
             print(f"히스토리 로드 실패: {e}")
-            return []
+            return {}
 
     def list_user_histories(self, user_id: str) -> List[dict]:
-        """사용자의 모든 히스토리 목록"""
+        """사용자의 모든 대화 목록 (최신순)"""
+        histories = []
         try:
-            histories = []
             if self._in_dataiku and self._folder:
-                prefix = f"{self.HISTORY_PREFIX}/{user_id}_"
+                prefix = f"{self.HISTORY_PREFIX}/{user_id}/"
                 for path in self._folder.list_paths_in_partition():
-                    if path.startswith(prefix) and path.endswith(".json"):
+                    clean = path.lstrip("/")
+                    if clean.startswith(prefix) and clean.endswith(".json"):
                         try:
-                            with self._folder.get_download_stream(path) as f:
+                            with self._folder.get_download_stream(clean) as f:
                                 data = json.loads(f.read().decode("utf-8"))
                             histories.append({
-                                "dataset": data.get("dataset"),
-                                "title": data.get("title", data.get("dataset", "")),
-                                "last_updated": data.get("last_updated"),
-                                "message_count": len(data.get("messages", []))
+                                "chat_id": data.get("chat_id", ""),
+                                "dataset": data.get("dataset", ""),
+                                "title": data.get("title", ""),
+                                "last_updated": data.get("last_updated", ""),
+                                "message_count": len(data.get("messages", [])),
                             })
                         except Exception:
                             continue
             else:
-                for filename in os.listdir(self.storage_dir):
-                    if filename.startswith(f"{user_id}_") and filename.endswith(".json"):
-                        filepath = os.path.join(self.storage_dir, filename)
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        histories.append({
-                            "dataset": data.get("dataset"),
-                            "title": data.get("title", data.get("dataset", "")),
-                            "last_updated": data.get("last_updated"),
-                            "message_count": len(data.get("messages", []))
-                        })
-            return sorted(histories, key=lambda x: x.get("last_updated", ""), reverse=True)
+                dirpath = os.path.join(self.storage_dir, user_id)
+                if os.path.isdir(dirpath):
+                    for fname in os.listdir(dirpath):
+                        if fname.endswith(".json"):
+                            fpath = os.path.join(dirpath, fname)
+                            try:
+                                with open(fpath, 'r', encoding='utf-8') as f:
+                                    data = json.load(f)
+                                histories.append({
+                                    "chat_id": data.get("chat_id", fname[:-5]),
+                                    "dataset": data.get("dataset", ""),
+                                    "title": data.get("title", ""),
+                                    "last_updated": data.get("last_updated", ""),
+                                    "message_count": len(data.get("messages", [])),
+                                })
+                            except Exception:
+                                continue
         except Exception:
-            return []
+            pass
+        print(f"[HistoryManager] {user_id}의 히스토리 {len(histories)}개 발견")
+        return sorted(histories, key=lambda x: x.get("last_updated", ""), reverse=True)
 
-    def delete_history(self, user_id: str, dataset_name: str) -> bool:
-        """히스토리 삭제"""
+    def delete_history(self, user_id: str, chat_id: str) -> bool:
         try:
             if self._in_dataiku and self._folder:
-                path = self._folder_path(user_id, dataset_name)
-                self._folder.delete_path(path)
+                self._folder.delete_path(self._chat_path(user_id, chat_id))
             else:
-                filepath = self.get_history_file(user_id, dataset_name)
-                if os.path.exists(filepath):
-                    os.remove(filepath)
+                path = self._chat_path(user_id, chat_id)
+                if os.path.exists(path):
+                    os.remove(path)
             return True
         except Exception:
             return False
 
 
 # ================================================================
-# DataikuManager
+# API Keys (Dataiku 웹앱 내부 전용)
+# ================================================================
+
+_OPENAI_API_KEY    = "REMOVED"
+_ANTHROPIC_API_KEY = ""
+_GROQ_API_KEY      = ""
+# ================================================================
+# HistoryManager - 사용자별 채팅 히스토리 관리
 # ================================================================
 
 class DataikuManager:
@@ -459,25 +477,32 @@ class DataikuFlowExporter:
                 # ── 차트 레이아웃 최적화 (대시보드 타일용) ──
                 try:
                     if _PLOTLY_AVAILABLE and hasattr(fig, 'update_layout'):
-                        # 차트 종류별 높이 동적 조절
-                        chart_h = 400
-                        if hasattr(fig, 'data') and fig.data:
-                            trace_type = type(fig.data[0]).__name__.lower()
-                            if 'heatmap' in trace_type:
-                                n_vars = len(fig.data[0].z) if hasattr(fig.data[0], 'z') and fig.data[0].z is not None else 8
-                                chart_h = max(400, n_vars * 60 + 100)
-                        fig.update_layout(
-                            height=chart_h,
-                            margin=dict(t=60, b=80, l=80, r=30),
-                            title=dict(font=dict(size=14)),
-                        )
-                        # 서브플롯 제목 겹침 방지
-                        if hasattr(fig.layout, 'annotations'):
-                            for ann in fig.layout.annotations:
-                                if hasattr(ann, 'text') and ann.text and len(ann.text) > 20:
-                                    ann.text = ann.text[:20] + '...'
-                                if hasattr(ann, 'font'):
-                                    ann.font.size = 10
+                        # 테이블은 이미 레이아웃이 설정되어 있으므로 건너뜀
+                        is_table = hasattr(fig, 'data') and fig.data and type(fig.data[0]).__name__.lower() == 'table'
+                        if not is_table:
+                            # 차트 종류별 높이 동적 조절
+                            chart_h = 500
+                            if hasattr(fig, 'data') and fig.data:
+                                trace_type = type(fig.data[0]).__name__.lower()
+                                if 'heatmap' in trace_type:
+                                    n_vars = len(fig.data[0].z) if hasattr(fig.data[0], 'z') and fig.data[0].z is not None else 8
+                                    chart_h = max(500, n_vars * 70 + 120)
+                            # 서브플롯(multi-row)이면 높이 확대
+                            has_subplots = hasattr(fig.layout, 'yaxis2') or hasattr(fig.layout, 'xaxis2')
+                            if has_subplots:
+                                chart_h = max(chart_h, 700)
+                            fig.update_layout(
+                                height=chart_h,
+                                margin=dict(t=50, b=60, l=60, r=20),
+                                title=dict(font=dict(size=13)),
+                            )
+                            # 서브플롯 제목 겹침 방지
+                            if hasattr(fig.layout, 'annotations'):
+                                for ann in fig.layout.annotations:
+                                    if hasattr(ann, 'text') and ann.text and len(ann.text) > 20:
+                                        ann.text = ann.text[:20] + '...'
+                                    if hasattr(ann, 'font'):
+                                        ann.font.size = 10
                 except Exception:
                     pass
 
@@ -578,13 +603,20 @@ class DataikuFlowExporter:
                 print(f"[FlowExporter] 이미 대시보드에 존재: {insight_id}")
                 return
 
-        # 타일 위치 계산 (12열 그리드 기준, 아래로 쌓기)
-        max_row = 0
-        for t in tiles:
-            box = t.get("box", {})
-            bottom = box.get("top", 0) + box.get("height", 4)
-            if bottom > max_row:
-                max_row = bottom
+        # 타일 위치 계산 (12열 그리드, 전체 폭 세로 배치)
+        TILE_W = 12
+        TILE_H = 15
+        if not tiles:
+            tile_left, tile_top = 0, 0
+        else:
+            max_bottom = 0
+            for t in tiles:
+                box = t.get("box", {})
+                t_bottom = box.get("top", 0) + box.get("height", TILE_H)
+                if t_bottom > max_bottom:
+                    max_bottom = t_bottom
+            tile_left = 0
+            tile_top = max_bottom
 
         new_tile = {
             "insightId": insight_id,
@@ -593,10 +625,10 @@ class DataikuFlowExporter:
             "title": label,
             "autoTitle": False,
             "box": {
-                "left": 0,
-                "top": max_row,
-                "width": 12,
-                "height": 15,
+                "left": tile_left,
+                "top": tile_top,
+                "width": TILE_W,
+                "height": TILE_H,
             },
             "tileParams": {},
             "clickAction": "DO_NOTHING",
@@ -607,7 +639,14 @@ class DataikuFlowExporter:
         settings.save()
         print(f"[FlowExporter] 대시보드 타일 추가 완료: {label}")
 
-    RECIPE_NAME = "compute_nexusdata_flow"
+    RECIPE_PREFIX = "compute_nexusdata_"
+
+    def _find_nexus_recipe(self, project) -> Optional[str]:
+        """기존 nexusdata 레시피 이름 찾기 (하나만 유지)"""
+        for r in project.list_recipes():
+            if r["name"].startswith(self.RECIPE_PREFIX):
+                return r["name"]
+        return None
 
     def publish_recipe(self, code: str, input_datasets: List[str],
                        label: str = "",
@@ -626,6 +665,7 @@ class DataikuFlowExporter:
         if not self._in_dataiku:
             return False, "Dataiku 연결이 필요합니다 (로컬 모드에서는 사용 불가)"
 
+        print(f"[FlowExporter] publish_recipe 시작: label={label!r}, inputs={input_datasets}")
         try:
             import dataiku
             client = dataiku.api_client()
@@ -634,7 +674,7 @@ class DataikuFlowExporter:
             # 출력 데이터셋 이름 생성
             slug = self._make_slug(label) if label else datetime.now().strftime("%Y%m%d_%H%M%S")
             out_name = f"nexus_{slug}"
-            display_label = label[:50] if label else out_name
+            display_label = label if label else out_name
 
             # 이름 중복 방지
             existing_ds = [d["name"] for d in project.list_datasets()]
@@ -644,49 +684,55 @@ class DataikuFlowExporter:
             # 이 블록의 코드 변환
             block_code = self._make_code_block(code, input_datasets, out_name, display_label)
 
-            existing_recipes = [r["name"] for r in project.list_recipes()]
+            existing_recipe_name = self._find_nexus_recipe(project)
 
-            if self.RECIPE_NAME in existing_recipes:
+            if existing_recipe_name:
                 # ── 기존 레시피에 코드 append + 출력 추가 ──
-                recipe = project.get_recipe(self.RECIPE_NAME)
+                recipe = project.get_recipe(existing_recipe_name)
                 settings = recipe.get_settings()
 
                 # 기존 코드 뒤에 새 블록 추가
-                old_code = settings.get_code()
+                old_code = settings.str_payload or ""
                 new_code = old_code + "\n\n" + block_code
-                settings.set_code(new_code)
+                settings.set_payload(new_code)
 
-                # 출력 데이터셋 추가 (기존 출력은 유지)
-                raw = settings.get_raw()
-                outputs = raw.get("outputs", {})
-                main_outputs = outputs.get("main", {}).get("items", [])
-                main_outputs.append({"ref": out_name, "appendMode": False})
-                outputs["main"] = {"items": main_outputs}
-                raw["outputs"] = outputs
-
-                # 출력 데이터셋 생성 (managed dataset)
+                # 출력 데이터셋 생성
                 try:
-                    project.create_dataset(out_name, type="Filesystem",
-                                           params={"connection": connection,
-                                                   "path": f"/{project.project_key}/{out_name}"})
+                    ds_creator = project.new_managed_dataset(out_name)
+                    ds_creator.with_store_into(connection)
+                    ds_creator.create()
                 except Exception:
-                    pass  # 이미 존재하면 무시
+                    pass
+
+                # 출력 데이터셋을 레시피에 추가
+                settings.add_output("main", out_name)
 
                 settings.save()
                 return True, f"✅ 레시피에 추가: {display_label} → {out_name}"
             else:
-                # ── 새 레시피 생성 ──
+                # ── 새 레시피 생성 (첫 번째 게시) ──
                 header = self._make_header(input_datasets)
                 full_code = header + "\n\n" + block_code
 
+                # 첫 출력 데이터셋 이름으로 nexusdata_ 접두사 사용
+                first_out = f"nexusdata_{slug}"
+                if first_out in existing_ds:
+                    first_out = f"nexusdata_{slug}_{datetime.now().strftime('%H%M%S')}"
                 builder = project.new_recipe("python")
                 for ds_name in input_datasets:
                     builder.with_input(ds_name)
-                builder.with_new_output_dataset(out_name, connection)
+                builder.with_new_output_dataset(first_out, connection)
                 builder.with_script(full_code)
                 recipe = builder.create()
-                return True, f"✅ Flow 레시피 생성: {display_label} → {out_name}"
+
+                # 생성된 레시피 코드에서 out_name 반영 (first_out으로 치환)
+                actual_name = recipe.name
+                print(f"[FlowExporter] 레시피 생성됨: {actual_name}")
+
+                return True, f"✅ Flow 레시피 생성: {display_label} → {first_out}"
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return False, f"레시피 게시 실패: {str(e)}"
 
     @staticmethod
@@ -795,6 +841,18 @@ STRICT RULES:
      사용자가 "병합해줘", "조인해줘", "필터링해줘", "정렬해줘", "피벗해줘", "그룹바이해줘" 등
      데이터 처리만 요청하고 시각화를 명시하지 않으면 result_df만 저장하세요.
      단, 사용자가 "보여줘", "그려줘", "차트", "그래프", "플롯" 등 시각화를 요청하면 fig를 생성하세요.
+     ⚠️ result_df는 반드시 정상적인 2차원 테이블 형태의 DataFrame이어야 합니다.
+     - 각 셀에는 숫자, 문자열 등 스칼라 값만 들어가야 합니다 (Series, DataFrame, list, dict 등 중첩 객체 절대 금지)
+     - 통계 요약(결측 비율, 컬럼별 통계 등)은 각 컬럼을 행으로 펼쳐서 표현하세요
+     - ❌ WRONG: result_df = pd.DataFrame({'결측비율': [some_series]}) — Series를 셀에 넣으면 안 됨
+     - ✅ CORRECT: result_df = merged_df.isnull().mean().reset_index(); result_df.columns = ['컬럼명', '결측비율']
+     - 여러 종류의 통계를 합칠 때도 각각 컬럼으로 만들어 하나의 테이블로 구성하세요
+     - 예: 결측 행 수 + 컬럼별 결측 비율 →
+       missing_info = merged_df.isnull().mean().reset_index()
+       missing_info.columns = ['컬럼명', '결측비율']
+       missing_info['결측건수'] = merged_df.isnull().sum().values
+       missing_info.loc[len(missing_info)] = ['전체 결측행 수', merged_df.isnull().any(axis=1).sum(), None]
+       result_df = missing_info
 8. NEVER use: os, sys, subprocess, open(), eval(), exec(), __import__, requests, urllib
 9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
 9. NEVER call fig.show() or plt.show() — the framework handles rendering automatically.
@@ -1331,121 +1389,23 @@ Generate the CORRECTED Python code:
     }
     
     @staticmethod
+    @staticmethod
     def build_insight_prompt(user_request: str, dataset_info: Dict, datasets_info: Optional[Dict] = None) -> str:
-        # 멀티 데이터셋일 때: 사용자 요청에 언급된 변수가 속한 데이터셋을 찾아 해당 통계 사용
-        matched_datasets = {}  # {ds_name: (ds_info, match_count)}
-
+        """간결한 결과 요약 프롬프트 (이상치/결측치/상관계수 등은 EDA에서 이미 제공)"""
+        ds_names = []
         if datasets_info and len(datasets_info) > 1:
-            request_lower = user_request.lower()
-            for ds_name, ds_info in datasets_info.items():
-                cols = ds_info.get('columns', [])
-                match_count = sum(1 for col in cols if col.lower() in request_lower)
-                # 데이터셋 이름 자체가 언급된 경우도 매칭
-                if ds_name.lower() in request_lower:
-                    match_count += 1
-                if match_count > 0:
-                    matched_datasets[ds_name] = (ds_info, match_count)
+            ds_names = list(datasets_info.keys())
+        ds_label = ", ".join(ds_names) if ds_names else "dataset"
 
-        # 매칭된 데이터셋이 여러 개면 모두 포함, 없으면 primary 사용
-        if len(matched_datasets) >= 2:
-            # 멀티 데이터셋 비교 요청
-            all_stats_sections = []
-            all_quality_alerts = []
-            for ds_name, (ds_info, _) in matched_datasets.items():
-                section = f"\n[{ds_name}]\nShape: {ds_info['shape']}\nColumns: {ds_info['columns']}\n"
-                section += f"Statistical Summary:\n{ds_info['describe_str']}\n"
-                section += f"Missing Values: {ds_info.get('missing_str', '결측치 없음')}\n"
-                section += f"Correlation: {ds_info.get('corr_str', '상관계수 정보 없음')}\n"
-                section += f"Outliers (IQR): {ds_info.get('outlier_str', '이상치 없음')}\n"
-                all_stats_sections.append(section)
-                # 품질 알림
-                for col, v in ds_info.get('missing_detail', {}).items():
-                    if v['pct'] >= PromptEngine.QUALITY_THRESHOLDS['missing_pct']:
-                        all_quality_alerts.append(f"[{ds_name}] {col} 결측치 {v['pct']}%")
-                total_rows = ds_info['shape'][0]
-                for col, cnt in ds_info.get('outlier_detail', {}).items():
-                    pct = round(cnt / total_rows * 100, 1) if total_rows > 0 else 0
-                    if pct >= PromptEngine.QUALITY_THRESHOLDS['outlier_pct']:
-                        all_quality_alerts.append(f"[{ds_name}] {col} 이상치 {cnt}건 ({pct}%)")
+        return f"""사용자 요청: "{user_request}"
+데이터셋: {ds_label}
+컬럼: {dataset_info.get('columns', [])}
+행수: {dataset_info.get('shape', [0])[0]:,}
 
-            quality_str = "\n".join(all_quality_alerts) if all_quality_alerts else "데이터 품질 양호"
-            datasets_section = "\n".join(all_stats_sections)
-            ds_names = ", ".join(matched_datasets.keys())
-
-            return f"""You are a sensor data analyst. Provide a concise 2-3 sentence insight.
-Use Korean terminology (백분위수, 평균, 중앙값, 표준편차, 상관계수, 이상치).
-When statistical significance is available (p-value), ALWAYS mention it explicitly.
-
-CRITICAL: This request involves MULTIPLE datasets: [{ds_names}].
-Use statistics from ALL relevant datasets below. Do NOT say data is unavailable when it is provided.
-
-User Request: "{user_request}"
-
-{datasets_section}
-
-Data Quality Alerts:
-{quality_str}
-
-Respond in Korean. Use actual numbers from the relevant datasets.
-If there are quality alerts, mention their potential impact.
-"""
-        else:
-            # 단일 데이터셋 매칭 또는 매칭 없음
-            if matched_datasets:
-                active_ds_name, (active_info, _) = max(matched_datasets.items(), key=lambda x: x[1][1])
-            else:
-                active_info = dataset_info
-                active_ds_name = "Primary"
-
-            # 품질 알림 메시지 동적 생성 (active_info 기준)
-            quality_alerts = []
-            missing_detail = active_info.get('missing_detail', {})
-            for col, v in missing_detail.items():
-                if v['pct'] >= PromptEngine.QUALITY_THRESHOLDS['missing_pct']:
-                    quality_alerts.append(f"{col} 컬럼 결측치 {v['pct']}% — 분석 신뢰도에 영향 가능")
-            outlier_detail = active_info.get('outlier_detail', {})
-            total_rows = active_info['shape'][0]
-            for col, cnt in outlier_detail.items():
-                pct = round(cnt / total_rows * 100, 1) if total_rows > 0 else 0
-                if pct >= PromptEngine.QUALITY_THRESHOLDS['outlier_pct']:
-                    quality_alerts.append(f"{col} 컬럼 이상치 {cnt}건 ({pct}%) — 분포 왜곡 가능")
-            dup_pct = active_info.get('dup_pct', 0)
-            if dup_pct >= PromptEngine.QUALITY_THRESHOLDS['duplicate_pct']:
-                quality_alerts.append(f"중복 행 {active_info.get('dup_count', 0)}건 ({dup_pct}%) — 밀도/빈도 왜곡 가능")
-            quality_str = "\n".join(quality_alerts) if quality_alerts else "데이터 품질 양호"
-
-            stat_tests_str = active_info.get('stat_tests_str', '통계 검정 없음')
-            return f"""You are a sensor data analyst. Provide a concise 2-3 sentence insight.
-Focus on: trends, anomalies, correlations, missing data patterns, and outliers.
-Use Korean terminology (백분위수, 평균, 중앙값, 표준편차, 상관계수, 이상치).
-When statistical significance is available (p-value), ALWAYS mention it explicitly.
-
-CRITICAL: Base your insight ONLY on variables mentioned in the user request.
-Do NOT mention variables from other datasets that are unrelated to the request.
-The relevant dataset for this request is: [{active_ds_name}]
-
-User Request: "{user_request}"
-Dataset: {active_ds_name}
-Shape: {active_info['shape']}
-Columns: {active_info['columns']}
-
-Statistical Summary:
-{active_info['describe_str']}
-
-Missing Values: {active_info.get('missing_str', '결측치 없음')}
-Correlation: {active_info.get('corr_str', '상관계수 정보 없음')}
-Outliers (IQR): {active_info.get('outlier_str', '이상치 없음')}
-Duplicate Rows: {active_info.get('dup_count', 0)}건 ({active_info.get('dup_pct', 0)}%)
-
-Statistical Significance Tests (Pearson, |r|>0.3 기준):
-{stat_tests_str}
-
-Data Quality Alerts:
-{quality_str}
-
-Respond in Korean. Be specific with actual numbers from the [{active_ds_name}] dataset only.
-If there are quality alerts above, mention them and explain their potential impact on the analysis.
-If statistical tests show p<0.05, explicitly state "통계적으로 유의미" in the insight.
+위 요청의 분석 결과를 1~2문장으로 간결하게 요약해주세요.
+- 이상치, 결측치, 상관계수, 데이터 품질 언급 금지 (별도 EDA에서 제공됨)
+- 사용자가 요청한 내용의 결과만 짧게 설명
+- 한국어로 답변
 """
 
     @staticmethod
@@ -2143,6 +2103,7 @@ def _init_session():
         "datasets_info": {},     # 멀티 데이터셋 메타: {"EL_Sensor": info1, ...}
         "llm_client": None,      # LLM 클라이언트 인스턴스
         "selected_dataset": None,
+        "chat_id": None,            # 현재 대화 고유 ID
         "error_count": 0,        # 현재 메시지의 오류 횟수
         "history_manager": HistoryManager(),  # 히스토리 관리자
         "user_id": HistoryManager.get_user_id(),  # 현재 사용자 ID
@@ -2154,17 +2115,8 @@ def _init_session():
 
 _init_session()
 
-# ── 마지막 대화 자동 복원 (Gemini 스타일) ──
+# ── 웹앱 시작 시 새 채팅 화면 (히스토리는 사이드바에서 접근) ──
 if not st.session_state.get("_history_restored"):
-    _hm = st.session_state.history_manager
-    _uid = st.session_state.user_id
-    _histories = _hm.list_user_histories(_uid)
-    if _histories and not st.session_state.messages:
-        _last = _histories[0]  # 가장 최근 대화
-        _saved = _hm.load_history(_uid, _last["dataset"])
-        if _saved:
-            st.session_state.messages = _saved
-            st.session_state.selected_dataset = _last["dataset"]
     st.session_state["_history_restored"] = True
 
 # ================================================================
@@ -2192,32 +2144,80 @@ with st.sidebar:
     # 대화 히스토리 헤더 + 새 채팅 아이콘 버튼
     st.markdown("### 대화 히스토리")
     if st.button("✏️ 새 채팅", use_container_width=True):
+        # 현재 대화가 있으면 먼저 저장
+        if st.session_state.messages and st.session_state.selected_dataset:
+            _hm = st.session_state.history_manager
+            _uid = st.session_state.user_id
+            if not st.session_state.get("chat_id"):
+                st.session_state.chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _msgs = [{k: v for k, v in m.items() if k not in ("fig", "result_df")} for m in st.session_state.messages]
+            _ds_names = list(st.session_state.get('datasets', {}).keys())
+            _ds_label = ', '.join(_ds_names) if _ds_names else st.session_state.selected_dataset
+            _first = next((m.get('content', '') for m in _msgs if m.get('role') == 'user'), '')
+            _short = (_first[:20] + '...') if len(_first) > 20 else _first
+            _title = f"{_ds_label} | {_short}" if _short else _ds_label
+            _hm.save_history(_uid, st.session_state.chat_id, _msgs, title=_title, dataset_name=st.session_state.selected_dataset)
         st.session_state.messages = []
         st.session_state.df = None
         st.session_state.dataset_info = None
         st.session_state.selected_dataset = None
+        st.session_state.chat_id = None
         st.session_state.prompt_key_counter = st.session_state.get('prompt_key_counter', 0) + 1
         st.rerun()
     
     # 히스토리 관리
     history_manager = st.session_state.history_manager
     user_id = st.session_state.user_id
-    
+
+    # 히스토리 행 스타일: 제목+X를 하나의 행처럼 보이게
+    st.markdown("""
+    <style>
+    /* 사이드바 columns gap 최소화 */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] { gap: 0.2rem; }
+    /* X 삭제 버튼 스타일 */
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] [data-testid="stColumn"]:last-child button {
+        padding: 0.25rem 0.4rem; font-size: 0.75rem; min-height: 0; 
+        border: none; background: transparent; color: #999;
+    }
+    section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] [data-testid="stColumn"]:last-child button:hover {
+        color: #e74c3c; background: rgba(231,76,60,0.08);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     # 저장된 히스토리 목록 (Gemini 스타일)
     histories = history_manager.list_user_histories(user_id)
+
+    # 삭제 처리 (query_params 기반)
+    _del_target = st.session_state.get("_hist_delete_target")
+    if _del_target:
+        history_manager.delete_history(user_id, _del_target)
+        if st.session_state.get("chat_id") == _del_target:
+            st.session_state.messages = []
+            st.session_state.chat_id = None
+        st.session_state._hist_delete_target = None
+        st.rerun()
+
     if histories:
         for idx, hist in enumerate(histories):
-            title = hist.get('title', hist['dataset'])
-            col_h, col_del = st.columns([5, 1])
-            with col_h:
-                if st.button(f"{title}", key=f"hist_{idx}_{hist['dataset'][:20]}", use_container_width=True):
+            title = hist.get('title', hist.get('dataset', ''))
+            chat_id = hist.get('chat_id', '')
+            h_col1, h_col2 = st.columns([6, 1])
+            with h_col1:
+                if st.button(f"{title}", key=f"hist_{idx}_{chat_id}", use_container_width=True):
                     try:
-                        saved_messages = history_manager.load_history(user_id, hist['dataset'])
-                        st.session_state.messages = saved_messages if saved_messages else []
-                        st.session_state.selected_dataset = hist['dataset']
-                        st.rerun()
+                        saved = history_manager.load_history(user_id, chat_id)
+                        if saved:
+                            st.session_state.messages = saved.get("messages", [])
+                            st.session_state.selected_dataset = saved.get("dataset", "")
+                            st.session_state.chat_id = chat_id
+                            st.rerun()
                     except Exception:
                         pass
+            with h_col2:
+                if st.button("✕", key=f"del_{idx}_{chat_id}", help="대화 삭제"):
+                    st.session_state._hist_delete_target = chat_id
+                    st.rerun()
     else:
         st.caption("저장된 대화가 없습니다.")
     
@@ -2423,11 +2423,15 @@ if st.session_state.df is not None:
                     # describe를 Plotly 테이블로 변환
                     _desc_reset = _desc_df.reset_index().rename(columns={"index": "변수"})
                     _fig_desc = go.Figure(data=[go.Table(
-                        header=dict(values=list(_desc_reset.columns), fill_color='#4472C4', font=dict(color='white', size=11), align='center'),
+                        header=dict(values=list(_desc_reset.columns), fill_color='#4472C4', font=dict(color='white', size=12), align='center', height=30),
                         cells=dict(values=[_desc_reset[c].round(2) if _desc_reset[c].dtype != 'object' else _desc_reset[c] for c in _desc_reset.columns],
-                                   fill_color='#D9E2F3', align='center', font=dict(size=10)),
+                                   fill_color='#D9E2F3', align='center', font=dict(size=11), height=28),
                     )])
-                    _fig_desc.update_layout(title=f"{_eda_ds_name} 기술통계", height=max(300, len(_desc_df) * 35 + 80))
+                    _fig_desc.update_layout(
+                        title=dict(text=f"{_eda_ds_name} 기술통계", x=0.5, font=dict(size=16)),
+                        height=max(350, len(_desc_df) * 40 + 100),
+                        margin=dict(t=60, b=20, l=20, r=20),
+                    )
                     _exp = st.session_state.flow_exporter
                     ok, msg = _exp.publish_chart(
                         user_id=st.session_state.user_id, fig=_fig_desc, code="",
@@ -2515,7 +2519,7 @@ if st.session_state.df is not None:
     st.markdown("---")
 
 # ── 2) 대화 내용 표시 ──
-for msg in st.session_state.messages:
+for msg_idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
             st.markdown(msg["content"])
@@ -2525,9 +2529,9 @@ for msg in st.session_state.messages:
             if msg.get("fig") is not None:
                 fig = msg["fig"]
                 if CodeExecutor.is_plotly_figure(fig):
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"chart_{msg_idx}")
                 elif CodeExecutor.is_matplotlib_figure(fig):
-                    st.pyplot(fig, use_container_width=True)
+                    st.pyplot(fig, use_container_width=True, key=f"pyplot_{msg_idx}")
             # 결과 데이터프레임 표시
             if msg.get("result_df") is not None:
                 _rdf = msg["result_df"]
@@ -2536,62 +2540,29 @@ for msg in st.session_state.messages:
             if msg.get("insight"):
                 st.info(f"**인사이트**: {msg['insight']}")
             # 코드 보기
-            msg_idx = st.session_state.messages.index(msg)
             _has_fig = msg.get("fig") is not None
             _has_result_df = msg.get("result_df") is not None
             _has_code = bool(msg.get("code"))
             if _has_code:
-                with st.expander("코드 보기", expanded=False):
+                with st.expander("🔍 코드 보기", expanded=False):
                     st.code(msg["code"], language="python")
-            # ── 게시 버튼: 대시보드 + Flow 레시피 ──
-            if _has_fig or _has_result_df:
-                _btn_col1, _btn_col2 = st.columns(2)
-                with _btn_col1:
-                    if st.button("📤 대시보드 게시", key=f"publish_{msg_idx}", use_container_width=True):
-                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
-                        _ds_name = st.session_state.selected_dataset or ''
-                        _exporter = st.session_state.flow_exporter
-                        _uid = st.session_state.user_id
-                        if _has_fig:
-                            ok, _pub_msg = _exporter.publish_chart(
-                                user_id=_uid, fig=msg["fig"], code=msg.get("code", ""),
-                                question=_user_q, insight=msg.get("insight", ""),
-                                dataset_name=_ds_name,
-                            )
-                        else:
-                            # result_df → Plotly Table로 변환해서 게시
-                            _rdf = msg["result_df"]
-                            _tbl_fig = go.Figure(data=[go.Table(
-                                header=dict(values=list(_rdf.columns), fill_color='#4472C4',
-                                            font=dict(color='white', size=11), align='center'),
-                                cells=dict(values=[_rdf[c].head(100) for c in _rdf.columns],
-                                           fill_color='#D9E2F3', align='center', font=dict(size=10)),
-                            )])
-                            _tbl_fig.update_layout(title=f"데이터 처리 결과 ({_rdf.shape[0]:,}행)", height=400)
-                            ok, _pub_msg = _exporter.publish_chart(
-                                user_id=_uid, fig=_tbl_fig, code=msg.get("code", ""),
-                                question=_user_q, dataset_name=_ds_name,
-                            )
-                        if ok:
-                            st.success(_pub_msg)
-                        else:
-                            st.error(_pub_msg)
-                with _btn_col2:
-                    if _has_code and st.button("🔧 Flow 레시피 게시", key=f"pub_recipe_{msg_idx}", use_container_width=True):
-                        _exporter = st.session_state.flow_exporter
-                        _ds_names = list(st.session_state.get("datasets", {}).keys())
-                        if not _ds_names:
-                            _ds_names = [st.session_state.selected_dataset or "dataset"]
-                        _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
-                        ok, _pub_msg = _exporter.publish_recipe(
-                            code=msg.get("code", ""),
-                            input_datasets=_ds_names,
-                            label=_user_q[:40],
-                        )
-                        if ok:
-                            st.success(_pub_msg)
-                        else:
-                            st.error(_pub_msg)
+            # ── 게시 버튼: Flow 레시피만 (대시보드는 자동 게시) ──
+            if (_has_fig or _has_result_df) and _has_code:
+                if st.button("🔧 Flow 레시피 게시", key=f"pub_recipe_{msg_idx}", use_container_width=True):
+                    _exporter = st.session_state.flow_exporter
+                    _ds_names = list(st.session_state.get("datasets", {}).keys())
+                    if not _ds_names:
+                        _ds_names = [st.session_state.selected_dataset or "dataset"]
+                    _user_q = st.session_state.messages[msg_idx - 1].get('content', '') if msg_idx > 0 else ''
+                    ok, _pub_msg = _exporter.publish_recipe(
+                        code=msg.get("code", ""),
+                        input_datasets=_ds_names,
+                        label=_user_q,
+                    )
+                    if ok:
+                        st.success(_pub_msg)
+                    else:
+                        st.error(_pub_msg)
             if msg.get("error"):
                 st.error(msg["error"])
                 retry_guide = _build_error_guide(msg["error"], st.session_state.dataset_info)
@@ -2805,7 +2776,7 @@ if prompt:
             try:
                 insight_prompt = PromptEngine.build_insight_prompt(prompt, dataset_info, datasets_info=datasets_info)
                 insight = llm_client.generate(
-                    system_prompt="You are a sensor data analyst. Answer concisely in Korean.",
+                    system_prompt="You are a data analyst. Summarize the analysis result in 1-2 SHORT sentences in Korean. Do NOT mention outliers, missing values, correlations, or data quality — those are shown elsewhere. Just briefly describe what the result shows.",
                     user_prompt=insight_prompt,
                 )
             except Exception:
@@ -2823,22 +2794,59 @@ if prompt:
             assistant_msg["insight"]    = insight
 
         st.session_state.messages.append(assistant_msg)
-        
-        # 히스토리 자동 저장
+
+        # ── 자동 대시보드 게시 (LLM 생성 차트/result_df만, EDA/품질리포트 제외) ──
+        if not error_msg and (fig is not None or result_df is not None):
+            try:
+                _auto_exporter = st.session_state.flow_exporter
+                _auto_uid = st.session_state.user_id
+                _auto_ds = st.session_state.selected_dataset or ''
+                if fig is not None:
+                    _auto_ok, _auto_msg = _auto_exporter.publish_chart(
+                        user_id=_auto_uid, fig=fig, code=code or "",
+                        question=prompt, insight=insight or "",
+                        dataset_name=_auto_ds,
+                    )
+                elif result_df is not None:
+                    import plotly.graph_objects as _auto_go
+                    _auto_tbl = _auto_go.Figure(data=[_auto_go.Table(
+                        header=dict(values=list(result_df.columns), fill_color='#4472C4',
+                                    font=dict(color='white', size=12), align='center', height=30),
+                        cells=dict(values=[result_df[c].head(100) for c in result_df.columns],
+                                   fill_color='#D9E2F3', align='center', font=dict(size=11), height=28),
+                    )])
+                    _auto_tbl.update_layout(
+                        title=dict(text=f"데이터 처리 결과 ({result_df.shape[0]:,}행)", x=0.5, font=dict(size=16)),
+                        height=max(350, min(len(result_df), 100) * 30 + 100),
+                        margin=dict(t=60, b=20, l=20, r=20),
+                    )
+                    _auto_ok, _auto_msg = _auto_exporter.publish_chart(
+                        user_id=_auto_uid, fig=_auto_tbl, code=code or "",
+                        question=prompt, dataset_name=_auto_ds,
+                    )
+                print(f"[AutoPublish] {'성공' if _auto_ok else '실패'}: {_auto_msg}")
+            except Exception as _auto_e:
+                print(f"[AutoPublish] 에러: {_auto_e}")
+
+        # 히스토리 자동 저장 (chat_id 기반)
         if st.session_state.selected_dataset:
             history_manager = st.session_state.history_manager
             user_id = st.session_state.user_id
+            # chat_id가 없으면 새로 생성
+            if not st.session_state.get("chat_id"):
+                st.session_state.chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            chat_id = st.session_state.chat_id
             messages_to_save = []
             for msg in st.session_state.messages:
                 msg_copy = {k: v for k, v in msg.items() if k not in ("fig", "result_df")}
                 messages_to_save.append(msg_copy)
-            # 데이터셋명 목록으로 타이틀 생성
             ds_names = list(st.session_state.get('datasets', {}).keys())
             ds_label = ', '.join(ds_names) if ds_names else st.session_state.selected_dataset
             first_user_msg = next((m.get('content', '') for m in messages_to_save if m.get('role') == 'user'), '')
             short_msg = first_user_msg[:20] + ('...' if len(first_user_msg) > 20 else '')
             hist_title = f"{ds_label} | {short_msg}" if short_msg else ds_label
-            history_manager.save_history(user_id, st.session_state.selected_dataset, messages_to_save, title=hist_title)
+            history_manager.save_history(user_id, chat_id, messages_to_save,
+                                         title=hist_title, dataset_name=st.session_state.selected_dataset)
 
     # 입력창 초기화 + 페이지 재렌더링
     st.session_state.prompt_key_counter = st.session_state.get('prompt_key_counter', 0) + 1
