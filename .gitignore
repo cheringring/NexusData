@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 .nexusdata_charts/
 copy.md
+replacements.txt
